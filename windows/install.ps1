@@ -37,10 +37,12 @@ Say '=== 1/5 файлы ==='
 $needed = @('claude-guard.ps1', 'claude-watchdog.ps1', 'claude-desktop-launch.ps1')
 $filesMissing = @()
 foreach ($f in $needed) {
-    $src = Join-Path $Src $f
-    if (Test-Path -LiteralPath $src) {
+    # ИМЯ ПЕРЕМЕННОЙ ВАЖНО: $src и $Src в PowerShell — одна и та же переменная,
+    # поэтому путь источника берём под другим именем (иначе накапливается путь первого файла).
+    $srcFile = Join-Path $Src $f
+    if (Test-Path -LiteralPath $srcFile) {
         try {
-            Copy-Item -LiteralPath $src -Destination (Join-Path $GuardHome $f) -Force -ErrorAction Stop
+            Copy-Item -LiteralPath $srcFile -Destination (Join-Path $GuardHome $f) -Force -ErrorAction Stop
             Say "  [+] $f"
         }
         catch {
