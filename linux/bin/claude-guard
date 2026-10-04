@@ -4,7 +4,7 @@
 # Политика fail-closed: нет туннеля / выход РФ / нет ответа / Anthropic отклонил
 # выход → запуск отменяется.
 #
-# Переносимая версия (v1.2): не хардкодит HOME, путь к бинарю Claude Code и имя
+# Переносимая версия (v1.3): не хардкодит HOME, путь к бинарю Claude Code и имя
 # VPN-интерфейса — всё определяется на месте.
 #
 #   claude-guard [аргументы claude...]   проверить и запустить Claude Code
@@ -13,17 +13,17 @@
 #   claude-guard --status                состояние + вердикт Anthropic + плохие выходы
 #   claude-guard --install               поставить/починить обёртку
 #   claude-guard --uninstall             вернуть оригинальный Claude Code
-#   claude-guard --self-test             доказать, что защита срабатывает (5 симуляций)
+#   claude-guard --self-test             доказать, что защита срабатывает (6 симуляций)
 #   claude-guard --doctor                что найдено в системе
 #   claude-guard --mark-blocked [IP]     пометить выход как отклонённый Anthropic
 #   claude-guard --reset-web-block       очистить память о заблокированных выходах
 #
 # Аварийный обход (только вручную): CLAUDE_GUARD_OVERRIDE=1
-# Симуляции для проверки: CLAUDE_GUARD_SIM=no-tun|ru-exit|timeout|region
+# Симуляции для проверки: CLAUDE_GUARD_SIM=no-tun|ru-exit|timeout|region|ipv6-leak
 
 set -uo pipefail
 
-VERSION="1.2-portable"
+VERSION="1.3-portable"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 STATE_DIR="${CLAUDE_GUARD_STATE:-$HOME/.local/state/claude-guard}"
 REAL_FILE="$STATE_DIR/real-claude"
@@ -124,6 +124,8 @@ probe_country() {
 
 current_exit_ip() {
   # IP, которым нас видит интернет (напрямую — то есть через туннель)
+  # CLAUDE_GUARD_EXIT_IP — подстановка выхода без сети (интеграционные и юнит-тесты)
+  [ -n "${CLAUDE_GUARD_EXIT_IP:-}" ] && { printf '%s\n' "$CLAUDE_GUARD_EXIT_IP"; return 0; }
   if [ "$SIM" = "timeout" ] || [ "$SIM" = "no-tun" ]; then echo ""; return 0; fi
   # ВАЖНО: только адреса, идущие ЧЕРЕЗ туннель — ipify/checkip сплит-правила
   # отправляют напрямую, они покажут домашний РФ-адрес и обманут проверку.
@@ -136,6 +138,19 @@ current_exit_ip() {
     [ "$attempt" = "1" ] && sleep 2
   done
   echo ""
+}
+
+# Глобальный маршрут IPv6 по умолчанию мимо туннеля = возможная утечка реального IP
+# (проверки IPv4 её не видят: маршрут к 1.1.1.1 идёт через туннель, а IPv6-трафик — нет).
+# Аргумент: интерфейс туннеля. Печатает интерфейс утечки, если он есть.
+ipv6_leak_iface() {
+  local tun="${1:-}" dev
+  command -v ip >/dev/null 2>&1 || return 0
+  ip -6 route show default 2>/dev/null | while read -r line; do
+    dev="$(printf '%s\n' "$line" | awk '{ for (i=1;i<=NF;i++) if ($i == "dev") { print $(i+1); exit } }')"
+    [ -n "$dev" ] || continue
+    [ "$dev" = "$tun" ] || printf '%s\n' "$dev"
+  done
 }
 
 # Самый свежий вердикт Anthropic из логов Claude Desktop (unix-время или 0)
@@ -229,7 +244,7 @@ check_anthropic_verdict() {
 run_checks() {
   # $1 = full (по умолчанию) | cli (только туннель + страна)
   local mode="${1:-full}"
-  local iface r_iface c_proxy c_direct ip ainfo verdict=0
+  local iface r_iface c_proxy c_direct ip ainfo verdict=0 leak=""
 
   echo "claude-guard $VERSION — проверка перед запуском Claude"
   echo
@@ -244,6 +259,21 @@ run_checks() {
   else
     printf '  [FAIL] маршрут идёт через %s, а VPN-интерфейс %s не задействован\n' "${r_iface:-<нет>}" "$iface"
     verdict=1; BLOCK_REASON="tunnel"
+  fi
+
+  # Утечка IPv6: глобальный маршрут по умолчанию мимо туннеля
+  if [ "$SIM" = "ipv6-leak" ]; then
+    leak="eth0"
+  elif [ -n "$iface" ]; then
+    leak="$(ipv6_leak_iface "$iface" | head -1)"
+  fi
+  if [ -n "$leak" ]; then
+    printf '  [FAIL] IPv6: глобальный маршрут идёт мимо туннеля (dev %s) — возможна утечка реального IP\n' "$leak"
+    verdict=1; [ -z "$BLOCK_REASON" ] && BLOCK_REASON="ipv6"
+  elif [ -n "$iface" ]; then
+    printf '  [OK  ] IPv6: глобального маршрута мимо туннеля нет\n'
+  else
+    printf '  [warn] IPv6: туннель не определён — проверить нечего\n'
   fi
 
   ip="$(curl -s --max-time "$PROBE_TIMEOUT" https://ipinfo.io/ip 2>/dev/null | tr -d '\r\n ' | head -c 45)"
@@ -382,7 +412,10 @@ self_test() {
   echo "4) Anthropic отклонил выход (region_unavailable) → должен отказать"
   CLAUDE_GUARD_SIM=region bash "$SELF" --check >/dev/null 2>&1; rc=$?
   [ $rc -ne 0 ] && echo "   PASS (отказ)" || { echo "   FAIL (пропустил!)"; fails=1; }
-  echo "5) реальная обстановка (режим CLI) → должен пропустить"
+  echo "5) утечка IPv6 (глобальный маршрут мимо туннеля) → должен отказать"
+  CLAUDE_GUARD_SIM=ipv6-leak bash "$SELF" --check >/dev/null 2>&1; rc=$?
+  [ $rc -ne 0 ] && echo "   PASS (отказ)" || { echo "   FAIL (пропустил!)"; fails=1; }
+  echo "6) реальная обстановка (режим CLI) → должен пропустить"
   bash "$SELF" --check-cli >/dev/null 2>&1; rc=$?
   [ $rc -eq 0 ] && echo "   PASS (пропуск)" || { echo "   FAIL (нет туннеля или выход РФ — реальная проблема)"; fails=1; }
   echo
@@ -409,11 +442,22 @@ block_help() {
     echo "  Причина: Anthropic отклонил IP этого выхода (region_unavailable)."
     echo "  Что делать: смени узел/страну в VPN-клиенте (не датацентр США) и повтори."
     echo "  Пометка снимется сама при смене выхода (claude-guard --status)."
+  elif [ "$BLOCK_REASON" = "ipv6" ]; then
+    echo "  Причина: есть глобальный маршрут IPv6 мимо туннеля — трафик может уйти"
+    echo "  с реального адреса, даже когда IPv4 идёт через VPN."
+    echo "  Что делать: отключить IPv6 на время работы или направить его в туннель"
+    echo "  (в VPN-клиенте — туннелирование IPv6 / TUN для обеих семейств)."
   else
     echo "  Что делать: включи VPN, дождись подключения, повтори."
     echo "  Диагностика: claude-guard --status | --doctor"
   fi
 }
+
+if [ -n "${CLAUDE_GUARD_SOURCE_ONLY:-}" ]; then
+  # Режим библиотеки: только определения функций — для юнит-тестов порогов
+  # (никаких проверок, сети и запуска Claude).
+  return 0 2>/dev/null || exit 0
+fi
 
 # ── точка входа ────────────────────────────────────────────────────────────
 

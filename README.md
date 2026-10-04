@@ -17,8 +17,9 @@
 ┌──────── проверка перед каждым запуском (fail-closed) ─────────┐
 │ 1. VPN-интерфейс поднят (tun/tap/wg/WireGuard/Wintun/TAP …)   │
 │ 2. интернет идёт через него                                    │
-│ 3. страна выхода ≠ РФ — двумя путями (как ходит CLI и напрямую) │
-│ 4. Anthropic принимает этот выход (вердикт из логов Desktop)   │
+│ 3. нет глобального маршрута IPv6 мимо туннеля (утечка IP)      │
+│ 4. страна выхода ≠ РФ — двумя путями (как ходит CLI и напрямую) │
+│ 5. Anthropic принимает этот выход (вердикт из логов Desktop)   │
 └───────────────────────────────────────────────────────────────┘
               │ всё ок                     │ любая неясность
               ▼                            ▼
@@ -29,7 +30,7 @@
 
 | Часть | Роль |
 |---|---|
-| **Страж** (`claude-guard`) | четыре проверки перед стартом; подменяет запуск `claude` (обёртка в `PATH` / шим в Windows) |
+| **Страж** (`claude-guard`) | пять проверок перед стартом; подменяет запуск `claude` (обёртка в `PATH` / шим в Windows) |
 | **Сторож** (`claude-watchdog`) | во время работы: нет туннеля 2 замера подряд (~30 с) или свежая жалоба Anthropic → Claude закрывается |
 | **Защита Desktop** | запуск только через ярлык с проверкой (GUI нельзя перехватить подменой), дальше — сторож |
 | **Самолечение** | обновление Claude Code через npm возвращает свой `claude`; таймер/задача Планировщика возвращает защиту |
@@ -65,10 +66,11 @@ claude-guard --self-test
 ### Убедиться, что защита действительно срабатывает
 
 ```bash
-CLAUDE_GUARD_SIM=ru-exit claude -p "тест"   # ожидается отказ, код 1
-CLAUDE_GUARD_SIM=no-tun  claude -p "тест"   # ожидается отказ, код 1
-CLAUDE_GUARD_SIM=region  claude -p "тест"   # ожидается отказ с советом «смени узел»
-claude-guard --self-test                    # 5 симуляций → «защита работает как задумано»
+CLAUDE_GUARD_SIM=ru-exit   claude -p "тест"   # ожидается отказ, код 1
+CLAUDE_GUARD_SIM=no-tun    claude -p "тест"   # ожидается отказ, код 1
+CLAUDE_GUARD_SIM=region    claude -p "тест"   # ожидается отказ с советом «смени узел»
+CLAUDE_GUARD_SIM=ipv6-leak claude -p "тест"   # утечка IPv6 → ожидается отказ, код 1
+claude-guard --self-test                     # 6 симуляций → «защита работает как задумано»
 ```
 
 ```powershell
@@ -78,12 +80,12 @@ $env:CLAUDE_GUARD_FORCE_DOWN='1'; .\claude-watchdog.ps1 -Once -DryRun; $env:CLAU
 
 ## Как это работает
 
-Четыре проверки, пороги свежести, файлы состояния, сторож и самолечение —
+Пять проверок, пороги свежести, файлы состояния, сторож и самолечение —
 [`docs/how-it-works.md`](docs/how-it-works.md).
 От чего защищает и от чего **не** защищает — [`docs/threat-model.md`](docs/threat-model.md).
 Почему решения именно такие — [`decisions/`](decisions/).
 
-Коротко про 4-ю проверку: публичного «примет ли Anthropic этот IP» нет —
+Коротко про проверку вердикта Anthropic: публичного «примет ли Anthropic этот IP» нет —
 `api.anthropic.com` отдаёт 401 с любого выхода, `claude.ai` закрыт Cloudflare-челленджем.
 Поэтому берётся вердикт самого Claude Desktop из его логов: строка `region_unavailable` →
 выход запоминается как плохой, и пока он текущий, запуск отменяется. Смена узла в VPN-клиенте
@@ -95,7 +97,7 @@ $env:CLAUDE_GUARD_FORCE_DOWN='1'; .\claude-watchdog.ps1 -Once -DryRun; $env:CLAU
 claude-guard --status           # туннель, страна выхода, вердикт Anthropic, плохие выходы
 claude-guard --check            # 0 = можно, 1 = нельзя (для скриптов и cron)
 claude-guard --check-cli        # только туннель + страна (то, что важно CLI и API)
-claude-guard --self-test        # 5 симуляций, ничего не ломает
+claude-guard --self-test        # 6 симуляций, ничего не ломает
 claude-guard --doctor           # что найдено в системе
 claude-guard --install          # поставить/починить обёртку (идемпотентно)
 claude-guard --uninstall        # снять защиту
@@ -110,7 +112,7 @@ claude-guard --reset-web-block     # очистить память о плохи
   ярлык «Claude (с VPN)», после запуска — сторож.
 - При обрыве VPN сторож закрывает Claude: несохранённые черновики могут потеряться. Это
   осознанный выбор в пользу «не выйти из РФ молча».
-- 4-я проверка опирается на логи Claude Desktop: если Desktop не запускался, жалоб нет и шаг
+- Проверка вердикта Anthropic опирается на логи Claude Desktop: если Desktop не запускался, жалоб нет и шаг
   молча пропускает (проверки туннеля и страны работают всегда).
 
 ## Дисклеймер
@@ -124,7 +126,11 @@ claude-guard --reset-web-block     # очистить память о плохи
 
 ```bash
 ./tests/bash-tests.sh                                # Linux-ветка (в песочнице)
+./tests/unit-thresholds.sh                           # пороги времени: свежесть/устаревание, память IP
+./tests/linux-install-e2e.sh                         # установка и снятие в изолированном HOME (--no-systemd)
+pwsh -NoProfile -File tests/unit-thresholds.ps1      # то же для Windows-ветки
 pwsh -NoProfile -File tests/win-guard-harness.ps1    # Windows-ветка без Windows
+powershell -File tests/win-e2e.ps1                   # установка/Планировщик/пути — только на Windows
 ./scripts/build-archive.sh                           # архив для переноса (./dist + sha256)
 ```
 

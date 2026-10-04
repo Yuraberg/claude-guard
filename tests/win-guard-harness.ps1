@@ -1,5 +1,5 @@
 # Тест-харнесс Windows-комплекта claude-guard под Linux-PowerShell 7.4.6.
-# Проверяем: синтаксис, детект бинаря, шим (CRLF), решения стража (5 симуляций),
+# Проверяем: синтаксис, детект бинаря, шим (CRLF), решения стража (6 симуляций),
 # 4-ю проверку (вердикт Anthropic из логов Claude Desktop), выбор и гашение процессов.
 
 $ErrorActionPreference = 'Continue'
@@ -80,11 +80,11 @@ Check 'полная проверка при живом туннеле: разр�
 Check 'режим CLI (-CheckCli): разрешено' ($LASTEXITCODE -eq 0) "код $LASTEXITCODE"
 
 Write-Host ''
-Write-Host "=== 5. Самопроверка: 5 симуляций (-SelfTest) ==="
+Write-Host "=== 5. Самопроверка: 6 симуляций (-SelfTest) ==="
 $st = & $PwshExe -NoProfile -File $GuardFile -SelfTest 2>&1
 Write-Host (($st | Out-String).Trim() -split "`n" | Where-Object { $_ -match '^\d\)|Итог' })
 Check 'самопроверка: все PASS' ($LASTEXITCODE -eq 0) "код $LASTEXITCODE"
-Check 'в выводе 5 PASS' ((($st | Out-String) -split "`n" | Where-Object { $_ -match '— PASS' }).Count -eq 5)
+Check 'в выводе 6 PASS' ((($st | Out-String) -split "`n" | Where-Object { $_ -match '— PASS' }).Count -eq 6)
 
 Write-Host ''
 Write-Host "=== 6. Отказ и пропуск на живом запуске ==="
@@ -94,12 +94,16 @@ $env:CLAUDE_GUARD_SIM = 'no-tun'
 $r2 = & $PwshExe -NoProfile -File $GuardFile '-p' 'тест' 2>&1; $c2 = $LASTEXITCODE
 $env:CLAUDE_GUARD_SIM = 'region'
 $r3 = & $PwshExe -NoProfile -File $GuardFile '-p' 'тест' 2>&1; $c3 = $LASTEXITCODE
+$env:CLAUDE_GUARD_SIM = 'ipv6-leak'
+$r5 = & $PwshExe -NoProfile -File $GuardFile '-p' 'тест' 2>&1; $c5 = $LASTEXITCODE
 $env:CLAUDE_GUARD_SIM = ''
 Check 'выход РФ: отказ (код 1)' ($c1 -eq 1) "код $c1"
 Check 'выход РФ: есть предупреждение' (($r1 | Out-String) -match 'ЗАПУСК ОТМЕНЁН')
 Check 'нет туннеля: отказ (код 1)' ($c2 -eq 1) "код $c2"
 Check 'выход отклонён Anthropic: отказ (код 1)' ($c3 -eq 1) "код $c3"
 Check 'выход отклонён Anthropic: сказано, что менять узел' (($r3 | Out-String) -match 'смени узел')
+Check 'утечка IPv6: отказ (код 1)' ($c5 -eq 1) "код $c5"
+Check 'утечка IPv6: сказано, что делать с IPv6' (($r5 | Out-String) -match 'IPv6')
 if ($hasReal) {
     $ok = & $PwshExe -NoProfile -File $GuardFile '--version' 2>&1; $c4 = $LASTEXITCODE
     Check 'VPN есть: настоящий Claude Code запущен' ($c4 -eq 0 -and (($ok | Out-String) -match 'Claude Code')) "код $c4"

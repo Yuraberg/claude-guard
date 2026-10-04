@@ -32,6 +32,8 @@ $ClaudeLogsDir = if ($env:CLAUDE_GUARD_LOGS_DIR) { $env:CLAUDE_GUARD_LOGS_DIR } 
 $RegionRe = 'region_unavailable|not available in your region'
 $RegionStale = 900   # вердикт старше этого возраста не относим к текущему выходу
 $ForceRegion = ($env:CLAUDE_GUARD_FORCE_REGION -eq '1')
+# тот же таймаут проб, что у стража: иначе при медленной сети решения расходятся
+$ProbeTimeoutMs = if ($env:CLAUDE_GUARD_TIMEOUT) { [int]$env:CLAUDE_GUARD_TIMEOUT * 1000 } else { 12000 }
 if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
 
 $Interval  = if ($env:CLAUDE_GUARD_INTERVAL) { [int]$env:CLAUDE_GUARD_INTERVAL } else { 15 }
@@ -156,7 +158,7 @@ function Get-ExitIp {
         foreach ($url in @('https://ipinfo.io/ip', 'https://ifconfig.co/ip')) {
             try {
                 $req = [System.Net.WebRequest]::Create($url)
-                $req.Timeout = 10000
+                $req.Timeout = $ProbeTimeoutMs
                 $req.UserAgent = 'claude-guard'
                 $req.Proxy = $null
                 $resp = $req.GetResponse()

@@ -17,6 +17,8 @@ mkdir -p "$PKG"
 cp -a "$ROOT/windows" "$PKG/windows"
 cp -a "$ROOT/linux" "$PKG/linux"
 cp -a "$ROOT/docs/install.md" "$PKG/README.md"
+# install.md ссылается на testing.md — кладём рядом, иначе в перенесённом комплекте битая ссылка
+cp -a "$ROOT/docs/testing.md" "$PKG/testing.md"
 
 chmod 755 "$PKG/linux/bin/"* "$PKG/linux/install.sh" 2>/dev/null || true
 find "$PKG" -name '.DS_Store' -delete

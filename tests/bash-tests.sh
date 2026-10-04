@@ -54,13 +54,13 @@ done
 
 echo
 echo "=== страж: базовые проверки ==="
-check_net "--self-test (5 симуляций)" 0 "$BIN/claude-guard" --self-test
+check_net "--self-test (6 симуляций)" 0 "$BIN/claude-guard" --self-test
 check_net "--check при живом туннеле (пробы через VPN)" 0 "$BIN/claude-guard" --check
 check_net "--check-cli" 0 "$BIN/claude-guard" --check-cli
 check "--doctor" 0 "$BIN/claude-guard" --doctor
 check_net "--status" 0 "$BIN/claude-guard" --status
 
-for sim in no-tun ru-exit timeout region; do
+for sim in no-tun ru-exit timeout region ipv6-leak; do
   CLAUDE_GUARD_SIM="$sim" "$BIN/claude-guard" -p тест >/dev/null 2>&1
   [ $? = 1 ] && pass "симуляция $sim: запуск отменён" || fail "симуляция $sim: нет отказа"
 done

@@ -104,11 +104,11 @@ $Report.Add(($doctor | Out-String)); Write-Host ($doctor | Out-String)
 $selftest = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $GuardHome 'claude-guard.ps1') -SelfTest 2>&1
 $Report.Add(($selftest | Out-String)); Write-Host ($selftest | Out-String)
 
-# WSL: если Claude Code живёт внутри WSL — там нужен Linux-комплект из папки wsl/
+# WSL: если Claude Code живёт внутри WSL — там нужен Linux-комплект из папки linux/
 $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
 if ($wsl) {
     $wslCheck = & wsl.exe -e bash -lc 'command -v claude 2>/dev/null || true' 2>$null
-    if ($wslCheck) { Say "  [!] Claude Code найден и внутри WSL: $wslCheck — там ставь Linux-комплект из папки wsl/" }
+    if ($wslCheck) { Say "  [!] Claude Code найден и внутри WSL: $wslCheck — там ставь Linux-комплект из папки linux/" }
 }
 
 Say ''

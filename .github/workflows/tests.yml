@@ -14,6 +14,10 @@ jobs:
       - uses: actions/checkout@v5
       - name: Прогон тестов стража и сторожа (в песочнице)
         run: ./tests/bash-tests.sh
+      - name: Юнит-тесты порогов и времени (без сети)
+        run: ./tests/unit-thresholds.sh
+      - name: E2E установки в изолированный HOME (режим --no-systemd, как в WSL)
+        run: ./tests/linux-install-e2e.sh
 
   windows-logic:
     name: Windows-ветка (PowerShell-логика)
@@ -22,5 +26,19 @@ jobs:
       - uses: actions/checkout@v5
       - name: Версия PowerShell
         run: pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
-      - name: Прогон харнесса (шин, симуляции, вердикт Anthropic, гашение процессов)
+      - name: Юнит-тесты порогов и времени Windows-ветки (без сети)
+        run: pwsh -NoProfile -File tests/unit-thresholds.ps1
+      - name: Прогон харнесса (шим, симуляции, вердикт Anthropic, гашение процессов)
         run: pwsh -NoProfile -File tests/win-guard-harness.ps1
+
+  windows-native:
+    name: Windows (установка, Планировщик, пути Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Версия Windows PowerShell
+        shell: powershell
+        run: $PSVersionTable.PSVersion.ToString()
+      - name: "E2E: установка → живые Windows-пути → снятие"
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/win-e2e.ps1

@@ -10,7 +10,7 @@ claude-guard (Windows) — Claude Code запускается только ес�
   claude-guard.ps1 -Doctor                 что найдено в системе
   claude-guard.ps1 -Install                поставить/починить шим вместо claude
   claude-guard.ps1 -Uninstall              снять шим
-  claude-guard.ps1 -SelfTest               доказать, что защита срабатывает (5 симуляций)
+  claude-guard.ps1 -SelfTest               доказать, что защита срабатывает (6 симуляций)
   claude-guard.ps1 -MarkBlocked [IP]       пометить выход как отклонённый Anthropic
   claude-guard.ps1 -ResetWebBlock          очистить память о заблокированных выходах
 
@@ -20,7 +20,7 @@ Desktop из его логов (%APPDATA%\Claude\logs) и запоминаем I
 пришёл region_unavailable. Пометка снимается сама при смене выхода.
 
 Аварийный обход только вручную: $env:CLAUDE_GUARD_OVERRIDE='1'
-Симуляции для проверки: $env:CLAUDE_GUARD_SIM = 'no-tun' | 'ru-exit' | 'timeout' | 'region'
+Симуляции для проверки: $env:CLAUDE_GUARD_SIM = 'no-tun' | 'ru-exit' | 'timeout' | 'region' | 'ipv6-leak'
 #>
 # Аргументы разбираем вручную: у скрипта НЕТ param(), иначе аргументы Claude Code
 # вроде `-p "текст"` перехватывались бы как параметры PowerShell и запуск ломался.
@@ -307,6 +307,8 @@ function Add-BlockedIp([string]$Ip) {
 function Get-ExitIp {
     # ВАЖНО: только адреса, которые идут ЧЕРЕЗ туннель (правила сплита отправляют
     # ipify/checkip напрямую — они покажут домашний РФ-адрес и обманут проверку).
+    # $env:CLAUDE_GUARD_EXIT_IP — подстановка выхода без сети (тесты).
+    if ($env:CLAUDE_GUARD_EXIT_IP) { return $env:CLAUDE_GUARD_EXIT_IP }
     if ($env:CLAUDE_GUARD_SIM -in @('timeout', 'no-tun')) { return '' }
     foreach ($attempt in 1..2) {
         foreach ($url in @('https://ipinfo.io/ip', 'https://ifconfig.co/ip')) {
@@ -323,6 +325,22 @@ function Get-ExitIp {
             } catch { }
         }
         if ($attempt -eq 1) { Start-Sleep -Seconds 2 }
+    }
+    return ''
+}
+
+# Глобальный маршрут IPv6 по умолчанию мимо туннеля = возможная утечка реального IP
+# (проверки IPv4 её не видят). Возвращает псевдоним интерфейса утечки или ''.
+function Get-IPv6LeakIface([string]$TunnelIface) {
+    try {
+        $routes = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction Stop
+    } catch { return '' }
+    foreach ($r in $routes) {
+        $alias = $r.InterfaceAlias
+        if (-not $alias) { continue }
+        if ($TunnelIface -and $alias -eq $TunnelIface) { continue }
+        if ($alias -match $VpnPattern) { continue }
+        return $alias
     }
     return ''
 }
@@ -381,6 +399,22 @@ function Invoke-GuardChecks {
     else {
         Write-Host ('  [FAIL] маршрут идёт через {0} ({1}), VPN не задействован' -f $tunnel.RouteIface, $tunnel.RouteDesc) -ForegroundColor Red
         $verdict = 1; $script:BlockReason = 'tunnel'
+    }
+
+    # Утечка IPv6: глобальный маршрут по умолчанию мимо туннеля
+    $leak = ''
+    if ($env:CLAUDE_GUARD_SIM -eq 'ipv6-leak') { $leak = 'Ethernet' }
+    elseif ($tunnel.HasAdapter) { $leak = Get-IPv6LeakIface $tunnel.RouteIface }
+    if ($leak) {
+        Write-Host ("  [FAIL] IPv6: глобальный маршрут идёт мимо туннеля ($leak) — возможна утечка реального IP") -ForegroundColor Red
+        $verdict = 1
+        if (-not $script:BlockReason) { $script:BlockReason = 'ipv6' }
+    }
+    elseif ($tunnel.HasAdapter) {
+        Write-Host '  [OK  ] IPv6: глобального маршрута мимо туннеля нет' -ForegroundColor Green
+    }
+    else {
+        Write-Host '  [warn] IPv6: туннель не определён — проверить нечего' -ForegroundColor Yellow
     }
 
     $cEnv = Get-ExitCountry 'env'
@@ -558,7 +592,13 @@ function Show-Doctor {
 }
 
 function Show-GuardHelp {
-    if ($script:BlockReason -eq 'anthropic') {
+    if ($script:BlockReason -eq 'ipv6') {
+        Write-Host '  Причина: есть глобальный маршрут IPv6 мимо туннеля — трафик может уйти'
+        Write-Host '  с реального адреса, даже когда IPv4 идёт через VPN.'
+        Write-Host '  Что делать: отключить IPv6 на время работы или направить его в туннель'
+        Write-Host '  (в VPN-клиенте — туннелирование IPv6).'
+    }
+    elseif ($script:BlockReason -eq 'anthropic') {
         Write-Host '  Причина: Anthropic отклонил IP этого выхода (region_unavailable).'
         Write-Host '  Что делать: смени узел/страну в VPN-клиенте (не датацентр США) и повтори.'
         Write-Host '  Пометка снимется сама при смене выхода (claude-guard.ps1 -Status).'
@@ -578,6 +618,7 @@ function Invoke-SelfTest {
         @{ Sim = 'ru-exit'; Name = 'выход = РФ';                Mode = 'full'; Expect = 1 },
         @{ Sim = 'timeout'; Name = 'проба недоступна';          Mode = 'full'; Expect = 1 },
         @{ Sim = 'region';  Name = 'Anthropic отклонил выход';  Mode = 'full'; Expect = 1 },
+        @{ Sim = 'ipv6-leak'; Name = 'утечка IPv6';              Mode = 'full'; Expect = 1 },
         @{ Sim = '';        Name = 'реальная обстановка (CLI)'; Mode = 'cli';  Expect = 0 }
     )
     $i = 0
@@ -597,6 +638,12 @@ function Invoke-SelfTest {
     if ($fails -eq 0) { Write-Host 'Итог: защита работает как задумано' -ForegroundColor Green }
     else { Write-Host "Итог: ЕСТЬ ПРОБЛЕМЫ ($fails)" -ForegroundColor Red }
     return $fails
+}
+
+if ($env:CLAUDE_GUARD_SOURCE_ONLY -eq '1') {
+    # Режим библиотеки: только определения функций — для юнит-тестов порогов
+    # (никаких проверок, сети и запуска Claude).
+    return
 }
 
 # ── точка входа ─────────────────────────────────────────────────────────────
