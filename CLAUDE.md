@@ -37,7 +37,12 @@ private/            личные документы, в git не попадаю�
    строкой в `docs/how-it-works.md`.
 5. **Изменения делать в репозитории**, затем ставить в рабочие пути (`install -m 755 …`) —
    не наоборот: правка «на месте» теряется при переустановке и расходится с репозиторием.
-6. **Пороги и сигналы** (`REGION_FRESH`, `REGION_STALE`, `API403_*`) менять только вместе с
+6. **Файлы `.ps1` с кириллицей — только с UTF-8 BOM.** Windows PowerShell 5.1 читает `.ps1`
+   без BOM как ANSI: текст превращается в мусор, скрипт может не распарситься. PowerShell 7
+   поломку не показывает, поэтому её ловят харнесс (проверка BOM) и джоб `windows-native`.
+   Шимы (`claude.cmd`, `claude.ps1`) — наоборот, только ASCII без BOM.
+   Проверка/починка: `./scripts/ps1-ensure-bom.sh [--check]`.
+7. **Пороги и сигналы** (`REGION_FRESH`, `REGION_STALE`, `API403_*`) менять только вместе с
    тестами: они отвечают за «свежая жалоба блокирует и помечает выход, 120–900 с — только
    предупреждение, старше — игнор». Новые права/проверки дублировать в обеих ветках
    (`windows/` и `linux/`) и в тестовых наборах обеих платформ, иначе ветки разъедутся.
@@ -51,6 +56,7 @@ private/            личные документы, в git не попадаю�
 pwsh -NoProfile -File tests/unit-thresholds.ps1       # пороги времени Windows (без сети)
 pwsh -NoProfile -File tests/win-guard-harness.ps1     # Windows-ветка (на Linux или в CI)
 powershell -File tests/win-e2e.ps1                    # только на Windows: задачи, PATH, адаптеры
+./scripts/ps1-ensure-bom.sh --check                   # кодировка .ps1 (BOM под Windows 5.1)
 ```
 
 Все прогоны изолированы (`CLAUDE_GUARD_STATE` / `CLAUDE_GUARD_HOME` / `CLAUDE_GUARD_LOGS_DIR`

@@ -1,4 +1,4 @@
-# uninstall.ps1 — снять claude-guard с этой машины.
+﻿# uninstall.ps1 — снять claude-guard с этой машины.
 $ErrorActionPreference = 'Continue'
 $GuardHome = if ($env:CLAUDE_GUARD_HOME) { $env:CLAUDE_GUARD_HOME } else { Join-Path $env:LOCALAPPDATA 'claude-guard' }
 

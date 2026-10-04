@@ -18,6 +18,8 @@ jobs:
         run: ./tests/unit-thresholds.sh
       - name: E2E установки в изолированный HOME (режим --no-systemd, как в WSL)
         run: ./tests/linux-install-e2e.sh
+      - name: Кодировка .ps1 под Windows PowerShell 5.1 (UTF-8 BOM)
+        run: ./scripts/ps1-ensure-bom.sh --check
 
   windows-logic:
     name: Windows-ветка (PowerShell-логика)

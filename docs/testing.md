@@ -9,9 +9,9 @@
 |---|---|---|---|
 | `tests/bash-tests.sh` | Linux-ветку целиком: синтаксис, шим, симуляции стража, вердикт Anthropic, сторож | `./tests/bash-tests.sh` | 29 |
 | `tests/unit-thresholds.sh` | пороги времени Linux-ветки — изолированно, без сети | `./tests/unit-thresholds.sh` | 25 |
-| `tests/linux-install-e2e.sh` | установку и снятие в изолированном `HOME` (режим `--no-systemd`) | `./tests/linux-install-e2e.sh` | 19 |
+| `tests/linux-install-e2e.sh` | установку и снятие в изолированном `HOME` (режим `--no-systemd`) | `./tests/linux-install-e2e.sh` | 21 (без Claude Desktop часть шагов SKIP) |
 | `tests/unit-thresholds.ps1` | пороги времени Windows-ветки — изолированно, без сети | `pwsh -NoProfile -File tests/unit-thresholds.ps1` | 29 |
-| `tests/win-guard-harness.ps1` | Windows-ветку без Windows: шим (CRLF/ASCII), симуляции, вердикт, гашение процессов | `pwsh -NoProfile -File tests/win-guard-harness.ps1` | 32 |
+| `tests/win-guard-harness.ps1` | Windows-ветку без Windows: кодировка `.ps1` (BOM), шим (CRLF/ASCII), симуляции, вердикт, гашение процессов | `pwsh -NoProfile -File tests/win-guard-harness.ps1` | 32 |
 | `tests/win-e2e.ps1` | установку на **настоящей Windows**: Планировщик, `PATH` в реестре, `Get-NetAdapter`/`Find-NetRoute`, ярлык, снятие | `powershell -File tests/win-e2e.ps1` | 31 |
 
 ## Юнит-тесты порогов (без сети)
@@ -43,6 +43,10 @@
 симуляций), совет «смени узел» в пути запуска и запись `reason=anthropic` в журнал, игнор
 старой жалобы, `--mark-blocked` / `--reset-web-block`, реакцию сторожа на жалобу (dry-run).
 
+Проверки, зависящие от установленных приложений, честно **пропускаются** (`SKIP`), а не
+проходят впустую: без Claude Desktop в системе переопределять нечего, и установщик этот шаг
+тоже пропускает. В CI раннер Desktop не имеет — соответственно `SKIP`.
+
 `tests/linux-install-e2e.sh` ставит комплект в пустой `HOME` так же, как это делает
 пользователь в WSL (`install.sh --no-systemd`), проверяет, что обёртка `~/.local/bin/claude`
 **действительно блокирует** живые запуски (симуляции `ru-exit`, `no-tun`), что переопределён
@@ -61,7 +65,9 @@ tar -xzf /tmp/pwsh.tar.gz -C /tmp/pwsh          # качать в ФАЙЛ, не
 ```
 
 Харнесс подкладывает фальшивый «настоящий» Claude Code в песочный `%LOCALAPPDATA%`,
-поэтому рабочая машина не затрагивается. Проверяет: синтаксис всех `.ps1`, шим (CRLF/ASCII),
+поэтому рабочая машина не затрагивается. Проверяет: синтаксис всех `.ps1`, **наличие UTF-8 BOM
+там, где в `.ps1` есть кириллица** (иначе Windows PowerShell 5.1 читает файл как ANSI и падает
+с `Unexpected token`; PowerShell 7 эту поломку не показывает), шим (CRLF/ASCII),
 6 симуляций стража, отказ при выходе РФ / без туннеля / при вердикте Anthropic / при утечке
 IPv6, живой запуск настоящего бинаря, выбор и **реальное гашение** процесса (функции
 принимают инъекцию `-ProcessList` / `-Victims`), разбор вердикта Anthropic из подложенных

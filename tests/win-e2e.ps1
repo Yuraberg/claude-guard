@@ -1,4 +1,4 @@
-# E2E-тест на НАСТОЯЩЕЙ Windows: установка, работа через шим, Планировщик задач,
+﻿# E2E-тест на НАСТОЯЩЕЙ Windows: установка, работа через шим, Планировщик задач,
 # пути Windows (Get-NetAdapter, Find-NetRoute), снятие.
 #
 # Запуск (обязательно на Windows):  powershell -NoProfile -ExecutionPolicy Bypass -File tests/win-e2e.ps1

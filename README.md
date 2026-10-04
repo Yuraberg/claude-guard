@@ -125,12 +125,13 @@ claude-guard --reset-web-block     # очистить память о плохи
 ## Разработка
 
 ```bash
-./tests/bash-tests.sh                                # Linux-ветка (в песочнице)
+./tests/bash-tests.sh                                # Linux-ветка: 29 проверок (в песочнице)
 ./tests/unit-thresholds.sh                           # пороги времени: свежесть/устаревание, память IP
 ./tests/linux-install-e2e.sh                         # установка и снятие в изолированном HOME (--no-systemd)
 pwsh -NoProfile -File tests/unit-thresholds.ps1      # то же для Windows-ветки
 pwsh -NoProfile -File tests/win-guard-harness.ps1    # Windows-ветка без Windows
 powershell -File tests/win-e2e.ps1                   # установка/Планировщик/пути — только на Windows
+./scripts/ps1-ensure-bom.sh --check                   # .ps1 с кириллицей: есть ли UTF-8 BOM
 ./scripts/build-archive.sh                           # архив для переноса (./dist + sha256)
 ```
 

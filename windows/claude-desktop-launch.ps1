@@ -1,4 +1,4 @@
-# Claude Desktop: запуск только при рабочем VPN.
+﻿# Claude Desktop: запуск только при рабочем VPN.
 # На Windows Claude Desktop ставится как Store-приложение (MSIX), перехватить его иконку
 # нельзя — поэтому: (1) этот запускатор для ярлыка «Claude (через VPN)»,
 # (2) сторож claude-watchdog.ps1 гасит Desktop, если VPN пропал.

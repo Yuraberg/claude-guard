@@ -1,4 +1,4 @@
-# Тест-харнесс Windows-комплекта claude-guard под Linux-PowerShell 7.4.6.
+﻿# Тест-харнесс Windows-комплекта claude-guard под Linux-PowerShell 7.4.6.
 # Проверяем: синтаксис, детект бинаря, шим (CRLF), решения стража (6 симуляций),
 # 4-ю проверку (вердикт Anthropic из логов Claude Desktop), выбор и гашение процессов.
 
@@ -32,7 +32,21 @@ foreach ($f in Get-ChildItem -Path $WinDir -Filter '*.ps1') {
 }
 
 Write-Host ''
-Write-Host "=== 2. Песочница с фальшивым Claude Code ==="
+Write-Host ''
+Write-Host "=== 2. Кодировка .ps1: UTF-8 BOM там, где есть кириллица ==="
+# Windows PowerShell 5.1 читает .ps1 без BOM как ANSI: кириллица превращается в мусор, и
+# файл может вообще не распарситься («Unexpected token ':' in expression»). PowerShell 7
+# читает UTF-8 и без BOM, поэтому под Linux поломка не видна — только на настоящей Windows.
+$noBom = @()
+foreach ($p in (@(Get-ChildItem (Join-Path $KitDir 'windows') -Filter '*.ps1') + @(Get-ChildItem $PSScriptRoot -Filter '*.ps1'))) {
+    $b = [IO.File]::ReadAllBytes($p.FullName)
+    if (-not @($b | Where-Object { $_ -gt 127 }).Count) { continue }        # чистый ASCII — BOM не нужен
+    $hasBom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
+    if (-not $hasBom) { $noBom += $p.Name }
+}
+Check 'все .ps1 с кириллицей имеют UTF-8 BOM' ($noBom.Count -eq 0) ("без BOM: " + ($noBom -join ', '))
+
+Write-Host "=== 3. Песочница с фальшивым Claude Code ==="
 $Sand = '/tmp/cg-win-sandbox'
 Remove-Item -Recurse -Force $Sand -ErrorAction SilentlyContinue
 $env:CLAUDE_GUARD_HOME = Join-Path $Sand 'guard'
@@ -61,7 +75,7 @@ else {
 Write-Host ("  подложен: $fake ($([math]::Round((Get-Item $fake).Length/1MB)) МБ, " + $(if ($hasReal) { 'настоящий Claude Code' } else { 'синтетический ELF — проверки запуска будут SKIP' }) + ')')
 
 Write-Host ''
-Write-Host "=== 3. Установка шима (-Install) ==="
+Write-Host "=== 4. Установка шима (-Install) ==="
 $out = & $PwshExe -NoProfile -File $GuardFile -Install 2>&1
 Write-Host (($out | Out-String).Trim() -split "`n" | Select-Object -Last 3)
 $shimCmd = Join-Path $env:CLAUDE_GUARD_HOME 'bin\claude.cmd'
@@ -73,21 +87,21 @@ Check 'claude.cmd в CRLF' ((($text -replace "`r`n", '').Split("`n").Count - 1) 
 Check 'claude.cmd только ASCII' (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0)
 
 Write-Host ''
-Write-Host "=== 4. Проверки стража ==="
+Write-Host "=== 5. Проверки стража ==="
 & $PwshExe -NoProfile -File $GuardFile -Check | Out-Null
 Check 'полная проверка при живом туннеле: разрешено' ($LASTEXITCODE -eq 0) "код $LASTEXITCODE"
 & $PwshExe -NoProfile -File $GuardFile -CheckCli | Out-Null
 Check 'режим CLI (-CheckCli): разрешено' ($LASTEXITCODE -eq 0) "код $LASTEXITCODE"
 
 Write-Host ''
-Write-Host "=== 5. Самопроверка: 6 симуляций (-SelfTest) ==="
+Write-Host "=== 6. Самопроверка: 6 симуляций (-SelfTest) ==="
 $st = & $PwshExe -NoProfile -File $GuardFile -SelfTest 2>&1
 Write-Host (($st | Out-String).Trim() -split "`n" | Where-Object { $_ -match '^\d\)|Итог' })
 Check 'самопроверка: все PASS' ($LASTEXITCODE -eq 0) "код $LASTEXITCODE"
 Check 'в выводе 6 PASS' ((($st | Out-String) -split "`n" | Where-Object { $_ -match '— PASS' }).Count -eq 6)
 
 Write-Host ''
-Write-Host "=== 6. Отказ и пропуск на живом запуске ==="
+Write-Host "=== 7. Отказ и пропуск на живом запуске ==="
 $env:CLAUDE_GUARD_SIM = 'ru-exit'
 $r1 = & $PwshExe -NoProfile -File $GuardFile '-p' 'тест' 2>&1; $c1 = $LASTEXITCODE
 $env:CLAUDE_GUARD_SIM = 'no-tun'
@@ -111,7 +125,7 @@ if ($hasReal) {
 else { Skip 'VPN есть: настоящий Claude Code запущен' 'в CI нет установленного Claude Code' }
 
 Write-Host ''
-Write-Host "=== 7. Сторож: выбор и гашение процессов ==="
+Write-Host "=== 8. Сторож: выбор и гашение процессов ==="
 $src = [IO.File]::ReadAllText($WatchFile)
 $head = $src.Substring(0, $src.IndexOf('$fails = 0'))
 Invoke-Expression $head
@@ -142,7 +156,7 @@ Check 'падение VPN: процесс погашен' $victim.HasExited 'в�
 if (-not $victim.HasExited) { Stop-Process -Id $victim.Id -Force }
 
 Write-Host ''
-Write-Host "=== 8. 4-я проверка: вердикт Anthropic из логов Claude Desktop ==="
+Write-Host "=== 9. Вердикт Anthropic из логов Claude Desktop ==="
 $logs = Join-Path $Sand 'claude-logs'
 New-Item -ItemType Directory -Force $logs | Out-Null
 $env:CLAUDE_GUARD_LOGS_DIR = $logs

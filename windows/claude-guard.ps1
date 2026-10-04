@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 claude-guard (Windows) — Claude Code запускается только если трафик уходит вне РФ.
 Политика fail-closed: нет уверенности в выходе — запуск отменяется.

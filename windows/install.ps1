@@ -1,4 +1,4 @@
-# install.ps1 — установка claude-guard на этой Windows-машине.
+﻿# install.ps1 — установка claude-guard на этой Windows-машине.
 # Админ НЕ нужен: PATH правится в HKCU, задачи ставятся для текущего пользователя.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1

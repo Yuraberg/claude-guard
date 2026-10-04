@@ -1,4 +1,4 @@
-# Claude VPN watchdog (Windows) — гасит Claude Desktop и Claude Code, если:
+﻿# Claude VPN watchdog (Windows) — гасит Claude Desktop и Claude Code, если:
 #   1) пропал VPN-туннель;
 #   2) Anthropic отклонил текущий выход (region_unavailable в логах Claude Desktop) —
 #      тогда выход помечается плохим и Claude закрывается, чтобы не долбить сервис.

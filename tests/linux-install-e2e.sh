@@ -20,7 +20,9 @@ dd if=/dev/zero bs=1M count=2 status=none >>"$HOME/.local/lib/node_modules/@anth
 chmod 755 "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
 
 fails=0
+skips=0
 pass() { printf 'PASS  %s\n' "$1"; }
+skip() { printf 'SKIP  %s (%s)\n' "$1" "$2"; skips=$((skips + 1)); }
 fail() { printf 'FAIL  %s%s\n' "$1" "${2:+ ($2)}"; fails=$((fails + 1)); }
 ok() { local n="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$n"; else fail "$n"; fi; }
 
@@ -43,10 +45,21 @@ for f in claude claude-guard claude-desktop-guard claude-desktop-watchdog; do
 done
 ok "обёртка claude указывает на страж" grep -q "claude-guard" "$HOME/.local/bin/claude"
 ok "журнал стража создан" test -d "$HOME/.local/state/claude-guard"
-ok "Claude Desktop закрыт страхом (.desktop переопределён)" \
-   test -f "$HOME/.local/share/applications/com.anthropic.Claude.desktop"
-ok "в .desktop не осталось прямого запуска приложения" \
-   bash -c "! grep -qE '^Exec=(/usr/lib/claude-desktop|/usr/bin/claude-desktop)' '$HOME/.local/share/applications/com.anthropic.Claude.desktop' 2>/dev/null"
+# Claude Desktop есть не на каждой машине (в CI его нет) — тогда установщик шаг пропускает,
+# и проверять нечего: это SKIP, а не PASS и не FAIL.
+DESKTOP_FILE="$HOME/.local/share/applications/com.anthropic.Claude.desktop"
+desktop_installed=0
+for p in /usr/bin/claude-desktop /usr/lib/claude-desktop/claude-desktop /opt/Claude/claude-desktop /opt/claude-desktop/claude-desktop; do
+  [ -x "$p" ] && desktop_installed=1
+done
+if [ "$desktop_installed" = 1 ]; then
+  ok "Claude Desktop закрыт стражем (.desktop переопределён)" test -f "$DESKTOP_FILE"
+  ok "в .desktop запуск идёт через claude-desktop-guard" grep -q 'Exec=.*claude-desktop-guard' "$DESKTOP_FILE"
+  ok "в .desktop не осталось прямого запуска приложения" \
+     bash -c "! grep -qE '^Exec=(/usr/lib/claude-desktop|/usr/bin/claude-desktop)' '$DESKTOP_FILE'"
+else
+  skip "переопределение .desktop для Claude Desktop" "в этой системе Claude Desktop не установлен"
+fi
 ok "systemd-службы НЕ поставлены (режим --no-systemd)" test ! -e "$HOME/.config/systemd/user/claude-desktop-tunnel-guard.service"
 
 echo
@@ -80,5 +93,5 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/d
 fi
 
 echo
-if [ "$fails" = 0 ]; then echo "ИТОГ: все проверки пройдены"; else echo "ИТОГ: провалов $fails"; fi
+if [ "$fails" = 0 ]; then echo "ИТОГ: все проверки пройдены (пропущено: $skips)"; else echo "ИТОГ: провалов $fails (пропущено: $skips)"; fi
 exit "$fails"
