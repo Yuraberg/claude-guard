@@ -34,14 +34,31 @@ Emit "Папка: $GuardHome"
 # ── 1. файлы ────────────────────────────────────────────────────────────────
 Say ''
 Say '=== 1/5 файлы ==='
-foreach ($f in @('claude-guard.ps1', 'claude-watchdog.ps1', 'claude-desktop-launch.ps1')) {
+$needed = @('claude-guard.ps1', 'claude-watchdog.ps1', 'claude-desktop-launch.ps1')
+$filesMissing = @()
+foreach ($f in $needed) {
     $src = Join-Path $Src $f
     if (Test-Path -LiteralPath $src) {
-        Copy-Item -LiteralPath $src -Destination (Join-Path $GuardHome $f) -Force
-        Say "  [+] $f"
+        try {
+            Copy-Item -LiteralPath $src -Destination (Join-Path $GuardHome $f) -Force -ErrorAction Stop
+            Say "  [+] $f"
+        }
+        catch {
+            Say "  [!] не скопировать $f`: $($_.Exception.GetType().Name): $($_.Exception.Message)"
+        }
     }
-    else { Say "  [!] нет файла $f" }
+    else { Say "  [!] нет исходного файла $f (искал в $Src)"; $filesMissing += $f }
 }
+# Контроль: без этих файлов задачи Планировщика и ярлык указывают в пустоту —
+# установка обязана об этом сказать и завершиться с ошибкой, а не «успешно».
+foreach ($f in $needed) {
+    if (-not (Test-Path -LiteralPath (Join-Path $GuardHome $f))) {
+        if ($filesMissing -notcontains $f) { Say "  [!] файл не оказался в $GuardHome`: $f" }
+        if ($filesMissing -notcontains $f) { $filesMissing += $f }
+    }
+}
+if ($filesMissing.Count -gt 0) { Say "  [!] НЕ УСТАНОВЛЕНО (нет файлов): $($filesMissing -join ', ')" }
+else { Say '  [+] все файлы на месте' }
 
 # ── 2. шим вместо claude ────────────────────────────────────────────────────
 Say ''
@@ -117,4 +134,9 @@ else { Say 'ВНИМАНИЕ: шим не поставлен — смотри в
 Say "Отчёт: $LogFile"
 
 [IO.File]::WriteAllLines($LogFile, $Report, (New-Object Text.UTF8Encoding($false)))
+if ($filesMissing.Count -gt 0) {
+    Say ''
+    Say "ОШИБКА: установка неполная, не хватает файлов: $($filesMissing -join ', ')"
+    exit 1
+}
 if ($shimOk) { exit 0 } else { exit 1 }

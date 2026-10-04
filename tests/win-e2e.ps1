@@ -58,8 +58,19 @@ $inst = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Wi
 $instOut = $inst | Out-String
 $instCode = $LASTEXITCODE
 if ($instCode -ne 0) { Write-Host ($instOut | Select-Object -First 1) }
+if ($instCode -ne 0) {
+    Write-Host '--- вывод установщика ---'
+    Write-Host $instOut
+}
 Check 'установщик завершился с кодом 0' ($instCode -eq 0) "код $instCode"
 Check 'отчёт установки создан' (Test-Path -LiteralPath $Report) $Report
+# Диагностика: что реально лежит в GuardHome сразу после установки
+Write-Host '--- GuardHome после установки ---'
+Get-ChildItem -LiteralPath $GuardHome -Recurse -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Write-Host ('  ' + $_.FullName.Replace($GuardHome, '.')) }
+foreach ($f in @('claude-guard.ps1', 'claude-watchdog.ps1', 'claude-desktop-launch.ps1')) {
+    Check "в GuardHome есть $f" (Test-Path -LiteralPath (Join-Path $GuardHome $f))
+}
 foreach ($f in @('claude.cmd', 'claude.ps1', 'claude', 'claude-guard.cmd', 'claude-guard.ps1')) {
     Check "шим создан: $f" (Test-Path -LiteralPath (Join-Path $ShimDir $f))
 }
