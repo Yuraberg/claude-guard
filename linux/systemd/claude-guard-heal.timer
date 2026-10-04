@@ -1,0 +1,11 @@
+[Unit]
+Description=Периодическая починка обёртки claude-guard
+
+[Timer]
+OnStartupSec=2min
+OnUnitActiveSec=12h
+Persistent=true
+Unit=claude-guard-heal.service
+
+[Install]
+WantedBy=timers.target

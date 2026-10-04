@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# claude-guard — запускает Claude только если трафик уходит вне РФ и Anthropic
+# принимает этот выход.
+# Политика fail-closed: нет туннеля / выход РФ / нет ответа / Anthropic отклонил
+# выход → запуск отменяется.
+#
+# Переносимая версия (v1.2): не хардкодит HOME, путь к бинарю Claude Code и имя
+# VPN-интерфейса — всё определяется на месте.
+#
+#   claude-guard [аргументы claude...]   проверить и запустить Claude Code
+#   claude-guard --check                 полная проверка (0 = можно, 1 = нельзя)
+#   claude-guard --check-cli             только туннель+страна (то, что важно CLI/API)
+#   claude-guard --status                состояние + вердикт Anthropic + плохие выходы
+#   claude-guard --install               поставить/починить обёртку
+#   claude-guard --uninstall             вернуть оригинальный Claude Code
+#   claude-guard --self-test             доказать, что защита срабатывает (5 симуляций)
+#   claude-guard --doctor                что найдено в системе
+#   claude-guard --mark-blocked [IP]     пометить выход как отклонённый Anthropic
+#   claude-guard --reset-web-block       очистить память о заблокированных выходах
+#
+# Аварийный обход (только вручную): CLAUDE_GUARD_OVERRIDE=1
+# Симуляции для проверки: CLAUDE_GUARD_SIM=no-tun|ru-exit|timeout|region
+
+set -uo pipefail
+
+VERSION="1.2-portable"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+STATE_DIR="${CLAUDE_GUARD_STATE:-$HOME/.local/state/claude-guard}"
+REAL_FILE="$STATE_DIR/real-claude"
+LOG="$STATE_DIR/guard.log"
+WEB_BLOCK_FILE="$STATE_DIR/web-blocked-ips"
+CLAUDE_LOGS_DIR="${CLAUDE_GUARD_LOGS_DIR:-$HOME/.config/Claude/logs}"
+WRAPPER="${CLAUDE_GUARD_WRAPPER:-$HOME/.local/bin/claude}"
+PROBE_TIMEOUT="${CLAUDE_GUARD_TIMEOUT:-12}"
+BLOCKED_COUNTRY="${CLAUDE_GUARD_BLOCKED_COUNTRY:-RU}"
+EXPECTED_COUNTRIES="${CLAUDE_GUARD_EXPECTED:-US CA GB DE NL FR CH SE FI PL EE LV LT CZ AT JP SG TR AE GE KZ AM}"
+VPN_IFACE_RE="${CLAUDE_GUARD_IFACE_RE:-^(tun|tap|wg|ppp|utun|ipsec|proton|nordlynx|mullvad|sing|nevpn|happ)}"
+# Сигнатура «Anthropic не принимает регион» в логах Claude Desktop
+REGION_RE='region_unavailable|not available in your region'
+REGION_FRESH=120    # насколько свежая жалоба считается «про этот выход» (сек)
+REGION_STALE=900    # окно, в котором вердикт ещё относится к текущему выходу
+API403_RE='Bootstrap API returned 403|authorize returned 403|API returned 403'
+API403_FRESH=300
+API403_MIN=2
+
+SIM="${CLAUDE_GUARD_SIM:-}"
+BLOCK_REASON=""
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+logline() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    notify-send -u critical -a claude-guard "$1" "$2" >/dev/null 2>&1 || true
+  fi
+}
+
+# ── определение окружения ───────────────────────────────────────────────────
+
+claude_candidates() {
+  echo "$HOME/.local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+  echo "$HOME/.local/share/claude/local/claude"
+  echo "$HOME/.claude/local/claude"
+  echo "/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+  echo "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+  echo "$HOME/.local/bin/claude.real"
+  if command -v npm >/dev/null 2>&1; then
+    local p; p=$(npm config get prefix 2>/dev/null)
+    [ -n "$p" ] && [ "$p" != "null" ] && echo "$p/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+  fi
+}
+
+real_is_sane() {
+  local f="$1"
+  [ -n "$f" ] && [ -x "$f" ] || return 1
+  [ "$f" = "$SELF" ] && return 1
+  [ "$f" = "$WRAPPER" ] && return 1
+  case "$(basename "$f")" in claude-guard|claude-guard.sh) return 1 ;; esac
+  local size; size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
+  [ "$size" -gt 1000000 ] || return 1
+  local kind; kind=$(file -b "$f" 2>/dev/null || echo "")
+  printf '%s' "$kind" | grep -Eq 'ELF|Mach-O' || return 1
+  return 0
+}
+
+real_claude() {
+  if [ -s "$REAL_FILE" ]; then
+    local saved; saved=$(cat "$REAL_FILE")
+    real_is_sane "$saved" && { echo "$saved"; return 0; }
+  fi
+  local c
+  while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    real_is_sane "$c" && { echo "$c"; return 0; }
+  done < <(claude_candidates)
+  local p
+  p=$(PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$(dirname "$WRAPPER")" | paste -sd:)" command -v claude 2>/dev/null || true)
+  if [ -n "$p" ] && real_is_sane "$p"; then echo "$p"; return 0; fi
+  return 1
+}
+
+vpn_iface() {
+  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E "$VPN_IFACE_RE" | head -1
+}
+
+route_iface() {
+  ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1
+}
+
+# ── проверки ────────────────────────────────────────────────────────────────
+
+probe_country() {
+  # $1 = proxy (как ходит CLI) | direct (как ходят приложения)
+  local mode="$1" args=() out url
+  [ "$mode" = "direct" ] && args+=(--noproxy '*')
+  [ "$SIM" = "ru-exit" ] && { echo "RU"; return 0; }
+  [ "$SIM" = "timeout" ] && { echo ""; return 1; }
+  for url in https://ipinfo.io/country https://ifconfig.co/country-iso; do
+    out=$(curl -s "${args[@]}" --max-time "$PROBE_TIMEOUT" "$url" 2>/dev/null | tr -d '\r\n ' | tr '[:lower:]' '[:upper:]')
+    case "$out" in [A-Z][A-Z]) echo "$out"; return 0 ;; esac
+  done
+  echo ""; return 1
+}
+
+current_exit_ip() {
+  # IP, которым нас видит интернет (напрямую — то есть через туннель)
+  if [ "$SIM" = "timeout" ] || [ "$SIM" = "no-tun" ]; then echo ""; return 0; fi
+  # ВАЖНО: только адреса, идущие ЧЕРЕЗ туннель — ipify/checkip сплит-правила
+  # отправляют напрямую, они покажут домашний РФ-адрес и обманут проверку.
+  local out attempt
+  for attempt in 1 2; do
+    for url in https://ipinfo.io/ip https://ifconfig.co/ip; do
+      out=$(curl -s --noproxy '*' --max-time "$PROBE_TIMEOUT" "$url" 2>/dev/null | tr -d '\r\n ' | head -c 45)
+      case "$out" in [0-9]*.[0-9]*) echo "$out"; return 0 ;; esac
+    done
+    [ "$attempt" = "1" ] && sleep 2
+  done
+  echo ""
+}
+
+# Самый свежий вердикт Anthropic из логов Claude Desktop (unix-время или 0)
+newest_ts_for() {
+  local re="$1" f line ts t newest=0
+  for f in "$CLAUDE_LOGS_DIR/main.log" "$CLAUDE_LOGS_DIR/claude.ai-web.log"; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      ts=$(printf '%s' "$line" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}')
+      [ -z "$ts" ] && continue
+      t=$(date -d "$ts" +%s 2>/dev/null) || continue
+      [ "$t" -gt "$newest" ] && newest=$t
+    done < <(grep -hE "$re" "$f" 2>/dev/null | tail -40)
+  done
+  echo "$newest"
+}
+
+newest_region_ts() { newest_ts_for "$REGION_RE"; }
+
+count_recent() {
+  local re="$1" win="$2" f line ts t n=0 now
+  now=$(date +%s)
+  for f in "$CLAUDE_LOGS_DIR/main.log" "$CLAUDE_LOGS_DIR/claude.ai-web.log"; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      ts=$(printf '%s' "$line" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}')
+      [ -z "$ts" ] && continue
+      t=$(date -d "$ts" +%s 2>/dev/null) || continue
+      [ $((now - t)) -le "$win" ] && n=$((n + 1))
+    done < <(grep -hE "$re" "$f" 2>/dev/null | tail -40)
+  done
+  echo "$n"
+}
+
+blocked_ip_recorded() { grep -q "^${1} " "$WEB_BLOCK_FILE" 2>/dev/null; }
+
+record_blocked_ip() {
+  local ip="$1"
+  [ -z "$ip" ] && return 0
+  blocked_ip_recorded "$ip" && return 0
+  echo "$ip $(date +%s)" >>"$WEB_BLOCK_FILE" 2>/dev/null || true
+}
+
+# 4-я проверка: принимает ли Anthropic этот выход.
+# mode=cli — не проверяем: для CLI/API важен только api.anthropic.com, который
+# такой выход принимает (доказано 401 на заведомо неверный ключ).
+check_anthropic_verdict() {
+  local mode="${1:-full}" ip newest api403 now signal=""
+  if [ "$mode" = "cli" ]; then
+    echo "не проверяется в режиме CLI (важен только api.anthropic.com)"
+    return 0
+  fi
+  if [ "$SIM" = "region" ]; then
+    echo "выход отклонён Anthropic (region_unavailable, симуляция)"
+    return 1
+  fi
+  ip=$(current_exit_ip)
+  now=$(date +%s)
+  newest=$(newest_region_ts)
+  api403=$(newest_ts_for "$API403_RE")
+
+  # Сильный сигнал: явный вердикт Anthropic. IP записываем только если вердикт
+  # свежий — иначе он мог быть получен на прежнем выходе (ложная блокировка).
+  if [ -n "$ip" ] && [ "$newest" -gt 0 ] && [ $((now - newest)) -le "$REGION_FRESH" ]; then
+    record_blocked_ip "$ip"
+  fi
+  if [ "$newest" -gt 0 ] && [ $((now - newest)) -le "$REGION_STALE" ]; then
+    signal="вердикт region_unavailable в логе Desktop в $(date -d "@$newest" '+%H:%M')"
+  fi
+
+  # Слабый сигнал (403): только предупреждение, вердикт не меняет — 403 приходит и
+  # от протухшей сессии (session_stale_relogin).
+  if [ -z "$signal" ] && [ "$api403" -gt 0 ] && [ $((now - api403)) -le "$API403_FRESH" ] \
+     && [ "$(count_recent "$API403_RE" "$API403_FRESH")" -ge "$API403_MIN" ]; then
+    signal="Desktop-API отдаёт 403 ($(date -d "@$api403" '+%H:%M'))"
+  fi
+
+  if [ -n "$ip" ] && blocked_ip_recorded "$ip"; then
+    echo "выход $ip отклонён Anthropic${signal:+ — $signal} — смени узел в VPN"
+    return 1
+  fi
+  if [ -z "$ip" ]; then echo "не удалось определить выход"; return 1; fi
+  if [ -n "$signal" ]; then
+    echo "принимает выход $ip, но есть след: $signal — если Desktop ругается на регион, смени узел"
+  else
+    echo "принимает выход $ip"
+  fi
+  return 0
+}
+
+run_checks() {
+  # $1 = full (по умолчанию) | cli (только туннель + страна)
+  local mode="${1:-full}"
+  local iface r_iface c_proxy c_direct ip ainfo verdict=0
+
+  echo "claude-guard $VERSION — проверка перед запуском Claude"
+  echo
+
+  iface="$(vpn_iface)"; r_iface="$(route_iface)"
+  if [ "$SIM" = "no-tun" ]; then
+    printf '  [FAIL] VPN-интерфейс: нет (симуляция)\n'; verdict=1; BLOCK_REASON="tunnel"
+  elif [ -z "$iface" ]; then
+    printf '  [warn] VPN-интерфейс не найден — полагаюсь на проверку страны выхода\n'
+  elif [ "$r_iface" = "$iface" ]; then
+    printf '  [OK  ] трафик идёт через %s\n' "$iface"
+  else
+    printf '  [FAIL] маршрут идёт через %s, а VPN-интерфейс %s не задействован\n' "${r_iface:-<нет>}" "$iface"
+    verdict=1; BLOCK_REASON="tunnel"
+  fi
+
+  ip="$(curl -s --max-time "$PROBE_TIMEOUT" https://ipinfo.io/ip 2>/dev/null | tr -d '\r\n ' | head -c 45)"
+  c_proxy="$(probe_country proxy)"
+  c_direct="$(probe_country direct)"
+
+  if [ -n "$c_proxy" ] && [ "$c_proxy" != "$BLOCKED_COUNTRY" ]; then
+    printf '  [OK  ] выход (через прокси/HTTPS_PROXY): %s %s\n' "${ip:-?}" "$c_proxy"
+  else
+    printf '  [FAIL] выход (через прокси/HTTPS_PROXY): %s %s\n' "${ip:-нет ответа}" "${c_proxy:-неизвестно}"
+    verdict=1; [ -z "$BLOCK_REASON" ] && BLOCK_REASON="country"
+  fi
+
+  if [ -n "$c_direct" ] && [ "$c_direct" != "$BLOCKED_COUNTRY" ]; then
+    printf '  [OK  ] выход (напрямую/через туннель): %s\n' "$c_direct"
+  else
+    printf '  [FAIL] выход (напрямую/через туннель): %s\n' "${c_direct:-неизвестно}"
+    verdict=1; [ -z "$BLOCK_REASON" ] && BLOCK_REASON="country"
+  fi
+
+  if [ "$verdict" = "0" ] && [ -n "$c_proxy" ]; then
+    case " $EXPECTED_COUNTRIES " in
+      *" $c_proxy "*) ;;
+      *) printf '  [warn] страна %s не в белом списке, но и не РФ — пропускаю\n' "$c_proxy" ;;
+    esac
+  fi
+
+  # 4-я проверка: принимает ли этот выход Anthropic
+  if [ "$verdict" = "0" ]; then
+    if ainfo=$(check_anthropic_verdict "$mode"); then
+      printf '  [OK  ] Anthropic: %s\n' "$ainfo"
+    else
+      printf '  [FAIL] Anthropic: %s\n' "$ainfo"
+      if [ "$mode" != "cli" ]; then verdict=1; [ -z "$BLOCK_REASON" ] && BLOCK_REASON="anthropic"; fi
+    fi
+  else
+    printf '  [SKIP] Anthropic: проверка не выполнялась (сначала туннель и страна)\n'
+  fi
+
+  echo
+  # ВАЖНО: путь запуска вызывает run_checks через $(...) — это подпроцесс, и
+  # переменная BLOCK_REASON в родителе теряется. Поэтому причина пишется в файл.
+  printf '%s' "${BLOCK_REASON:-}" > "$STATE_DIR/last-reason" 2>/dev/null
+  logline "verdict=$verdict reason=${BLOCK_REASON:-none} mode=$mode iface=${iface:-none} route=${r_iface:-none} ip=${ip:-?} country_proxy=${c_proxy:-?} country_direct=${c_direct:-?} sim=${SIM:-none}"
+  return $verdict
+}
+
+# ── установка / диагностика ────────────────────────────────────────────────
+
+install_wrapper() {
+  local current real
+  current=$(readlink -f "$WRAPPER" 2>/dev/null || true)
+  if [ -n "$current" ] && [ "$current" != "$SELF" ] && real_is_sane "$current"; then
+    printf '%s\n' "$current" >"$REAL_FILE"
+  fi
+  real=$(real_claude) || {
+    echo "ОШИБКА: настоящий Claude Code не найден." >&2
+    echo "Кандидаты, которые проверялись:" >&2
+    claude_candidates | sed 's/^/  /' >&2
+    echo "Установи Claude Code (npm install -g @anthropic-ai/claude-code) и повтори." >&2
+    return 1
+  }
+  mkdir -p "$(dirname "$WRAPPER")"
+  # ВАЖНО: снести возможный симлинк — иначе запись уйдёт по ссылке и затрёт бинарь.
+  rm -f "$WRAPPER"
+  printf '#!/usr/bin/env bash\n# Обёртка claude-guard: Claude стартует только через проверку VPN.\nexec "%s" "$@"\n' "$SELF" >"$WRAPPER"
+  chmod 755 "$WRAPPER"
+  echo "Обёртка: $WRAPPER → $SELF → $real"
+  logline "install wrapper=$WRAPPER real=$real"
+}
+
+uninstall_wrapper() {
+  local real; real=$(real_claude) || { echo "ОШИБКА: оригинал не найден" >&2; return 1; }
+  ln -sf "$real" "$WRAPPER"
+  echo "Обёртка снята: $WRAPPER → $real"
+  logline "uninstall restored -> $real"
+}
+
+show_status() {
+  echo "claude-guard $VERSION"
+  echo "  страж:    $SELF"
+  echo "  обёртка:  $WRAPPER → $(readlink -f "$WRAPPER" 2>/dev/null)"
+  echo "  реальный: $(real_claude || echo 'НЕ НАЙДЕН')"
+  echo "  лог:      $LOG"
+  local ts; ts=$(newest_region_ts)
+  if [ "$ts" != "0" ]; then
+    echo "  вердикт Anthropic: $(date -d "@$ts" '+%d.%m.%Y %H:%M') — region_unavailable"
+  else
+    echo "  вердикт Anthropic: жалоб в логах Claude Desktop нет"
+  fi
+  if [ -s "$WEB_BLOCK_FILE" ]; then
+    echo "  запомнены как отклонённые выходы:"
+    while read -r bip bt; do
+      echo "    $bip  (с $(date -d "@${bt:-0}" '+%d.%m %H:%M' 2>/dev/null))"
+    done <"$WEB_BLOCK_FILE"
+  fi
+  echo
+  run_checks full; local rc=$?
+  echo "Итог: $([ $rc -eq 0 ] && echo 'можно работать' || echo 'РАБОТАТЬ НЕЛЬЗЯ')"
+  return $rc
+}
+
+show_doctor() {
+  echo "Диагностика окружения"
+  echo "  ОС:        $( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -sr )"
+  echo "  HOME:      $HOME"
+  echo "  curl:      $(command -v curl || echo 'НЕТ — обязателен!')"
+  echo "  file:      $(command -v file || echo 'НЕТ (проверка бинаря ослабнет)')"
+  echo "  ip:        $(command -v ip || echo 'НЕТ')"
+  echo "  systemd:   $( (systemctl --user >/dev/null 2>&1 && echo 'есть (user)') || echo 'нет/недоступен' )"
+  echo "  notify:    $(command -v notify-send || echo 'нет (уведомлений не будет)')"
+  echo "  VPN-интер: $(vpn_iface || echo 'не найден')   маршрут 1.1.1.1: $(route_iface || echo 'нет')"
+  echo "  логи Claude Desktop: $CLAUDE_LOGS_DIR — $([ -d "$CLAUDE_LOGS_DIR" ] && echo 'есть (4-я проверка работает)' || echo 'нет (4-я проверка будет пустой)')"
+  echo "  Claude Code:"
+  claude_candidates | while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    if real_is_sane "$c"; then echo "    [OK]   $c"; else echo "    [--]   $c"; fi
+  done
+  echo "  Claude Desktop: $(for p in /usr/bin/claude-desktop /usr/lib/claude-desktop/claude-desktop /opt/Claude/claude-desktop; do [ -x "$p" ] && echo "$p" && break; done || true)"
+  echo "  обёртка сейчас: $(readlink -f "$WRAPPER" 2>/dev/null || echo 'нет')"
+}
+
+self_test() {
+  local rc fails=0
+  echo "Самопроверка защиты (симуляции)"
+  echo
+  echo "1) VPN-интерфейса нет → должен отказать"
+  CLAUDE_GUARD_SIM=no-tun bash "$SELF" --check >/dev/null 2>&1; rc=$?
+  [ $rc -ne 0 ] && echo "   PASS (отказ)" || { echo "   FAIL (пропустил!)"; fails=1; }
+  echo "2) выход = РФ → должен отказать"
+  CLAUDE_GUARD_SIM=ru-exit bash "$SELF" --check >/dev/null 2>&1; rc=$?
+  [ $rc -ne 0 ] && echo "   PASS (отказ)" || { echo "   FAIL (пропустил!)"; fails=1; }
+  echo "3) проба недоступна → должен отказать (fail-closed)"
+  CLAUDE_GUARD_SIM=timeout bash "$SELF" --check >/dev/null 2>&1; rc=$?
+  [ $rc -ne 0 ] && echo "   PASS (отказ)" || { echo "   FAIL (пропустил!)"; fails=1; }
+  echo "4) Anthropic отклонил выход (region_unavailable) → должен отказать"
+  CLAUDE_GUARD_SIM=region bash "$SELF" --check >/dev/null 2>&1; rc=$?
+  [ $rc -ne 0 ] && echo "   PASS (отказ)" || { echo "   FAIL (пропустил!)"; fails=1; }
+  echo "5) реальная обстановка (режим CLI) → должен пропустить"
+  bash "$SELF" --check-cli >/dev/null 2>&1; rc=$?
+  [ $rc -eq 0 ] && echo "   PASS (пропуск)" || { echo "   FAIL (нет туннеля или выход РФ — реальная проблема)"; fails=1; }
+  echo
+  echo "Полная проверка сейчас:"
+  run_checks full | sed 's/^/   /'
+  echo
+  [ $fails -eq 0 ] && echo "Итог: защита работает как задумано" || echo "Итог: ЕСТЬ ПРОБЛЕМЫ"
+  return $fails
+}
+
+exec_real() {
+  local real; real=$(real_claude)
+  if ! real_is_sane "$real"; then
+    echo "ОШИБКА claude-guard: Claude Code не найден или повреждён (${real:-нет})." >&2
+    echo "Восстанови: npm install -g @anthropic-ai/claude-code --force" >&2
+    logline "exec_real SANITY_FAIL path=${real:-none}"
+    exit 3
+  fi
+  exec "$real" "$@"
+}
+
+block_help() {
+  if [ "$BLOCK_REASON" = "anthropic" ]; then
+    echo "  Причина: Anthropic отклонил IP этого выхода (region_unavailable)."
+    echo "  Что делать: смени узел/страну в VPN-клиенте (не датацентр США) и повтори."
+    echo "  Пометка снимется сама при смене выхода (claude-guard --status)."
+  else
+    echo "  Что делать: включи VPN, дождись подключения, повтори."
+    echo "  Диагностика: claude-guard --status | --doctor"
+  fi
+}
+
+# ── точка входа ────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  --check)
+    if [ -n "${CLAUDE_GUARD_OVERRIDE:-}" ]; then
+      echo "CLAUDE_GUARD_OVERRIDE=1 — проверки пропущены"; exit 0
+    fi
+    run_checks full; rc=$?
+    if [ $rc -ne 0 ]; then
+      echo "ОТКАЗ: Claude заблокирован — трафик может уйти из РФ или быть отклонён Anthropic."
+      block_help
+      notify "Claude заблокирован" "$([ "$BLOCK_REASON" = anthropic ] && echo 'Anthropic отклоняет этот выход VPN — смени узел.' || echo 'Нет VPN-туннеля или выход из РФ. Включи VPN.')"
+    fi
+    exit $rc ;;
+  --check-cli)
+    run_checks cli; rc=$?
+    [ $rc -ne 0 ] && block_help
+    exit $rc ;;
+  --status)    show_status; exit $? ;;
+  --doctor)    show_doctor; exit 0 ;;
+  --install)   install_wrapper; exit $? ;;
+  --uninstall) uninstall_wrapper; exit $? ;;
+  --self-test) self_test; exit $? ;;
+  --mark-blocked)
+    ip="${2:-$(current_exit_ip)}"
+    if [ -z "$ip" ]; then echo "не удалось определить выход" >&2; exit 1; fi
+    record_blocked_ip "$ip"
+    echo "выход $ip помечен как отклонённый Anthropic: $WEB_BLOCK_FILE"
+    logline "manual mark-blocked ip=$ip"; exit 0 ;;
+  --reset-web-block)
+    rm -f "$WEB_BLOCK_FILE"
+    echo "память о заблокированных выходах очищена"
+    logline "manual reset web-block"; exit 0 ;;
+  --version|-v|--help|-h) exec_real "$@" ;;
+esac
+
+if [ -n "${CLAUDE_GUARD_OVERRIDE:-}" ]; then
+  echo "[claude-guard] ВНИМАНИЕ: проверка обойдена (CLAUDE_GUARD_OVERRIDE)" >&2
+  logline "launch OVERRIDE args=$*"
+else
+  out=$(run_checks full); rc=$?
+  [ $rc -ne 0 ] && BLOCK_REASON="$(cat "$STATE_DIR/last-reason" 2>/dev/null)"
+  if [ $rc -ne 0 ]; then
+    printf '%s\n' "$out"
+    echo "──────────────────────────────────────────────────────────────"
+    echo "  ЗАПУСК ОТМЕНЁН: нет уверенности, что Anthropic видит нас не из РФ."
+    block_help
+    echo "──────────────────────────────────────────────────────────────"
+    notify "Claude Code не запущен" "$([ "$BLOCK_REASON" = anthropic ] && echo 'Anthropic отклоняет этот выход VPN — смени узел.' || echo 'Нет VPN-туннеля или выход из РФ. Включи VPN и повтори.')"
+    logline "launch BLOCKED reason=${BLOCK_REASON:-none} args=$*"
+    exit 1
+  fi
+  logline "launch OK args=$*"
+fi
+
+exec_real "$@"

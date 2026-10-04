@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# claude-desktop-guard — Claude Desktop запускается только при рабочем VPN.
+# Переносимая версия: путь к приложению определяется на месте.
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+GUARD="${CLAUDE_GUARD_BIN:-$SELF_DIR/claude-guard}"
+
+APP=""
+for p in /usr/bin/claude-desktop /usr/lib/claude-desktop/claude-desktop \
+         /opt/Claude/claude-desktop /opt/claude-desktop/claude-desktop \
+         "$HOME/.local/bin/claude-desktop.real"; do
+  [ -x "$p" ] && { APP="$p"; break; }
+done
+
+if [ -z "$APP" ]; then
+  echo "Claude Desktop не найден — запускать нечего." >&2
+  exit 127
+fi
+
+if ! "$GUARD" --check; then
+  echo "ЗАПУСК Claude Desktop ОТМЕНЁН: нет VPN или выход из РФ." >&2
+  if command -v notify-send >/dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    notify-send -u critical -a claude-guard "Claude Desktop не запущен" \
+      "Нет VPN-туннеля или выход из РФ. Включи VPN и повтори." >/dev/null 2>&1 || true
+  fi
+  exit 1
+fi
+
+exec "$APP" "$@"

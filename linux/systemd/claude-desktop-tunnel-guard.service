@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude: сторож VPN (гасит Claude Desktop/Code при потере VPN)
+Documentation=file://%h/.local/bin/claude-desktop-watchdog
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-desktop-watchdog
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

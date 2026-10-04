@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# claude-desktop-watchdog — сторож Claude Desktop и Claude Code (переносимая версия).
+#
+# Раз в INTERVAL секунд:
+#   1) проверяет VPN-туннель; пропал (THRESHOLD провалов подряд) → гасит Claude;
+#   2) следит за вердиктом Anthropic в логах Claude Desktop: свежая жалоба
+#      region_unavailable означает, что Anthropic не принимает текущий выход —
+#      запоминает IP выхода как плохой и гасит Claude.
+#
+#   claude-desktop-watchdog [--once] [--dry-run] [--help]
+# Переменные: WATCH_INTERVAL (15), WATCH_THRESHOLD (2), WATCH_PROBE_EVERY (10),
+#   WATCH_PATTERNS, WATCH_TUN_IF, WATCH_KILL=0 (не убивать), WATCH_FORCE_DOWN=1
+#   (симуляция падения туннеля), WATCH_FORCE_REGION=1 (симуляция жалобы Anthropic)
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+GUARD="${CLAUDE_GUARD_BIN:-$SELF_DIR/claude-guard}"
+STATE_DIR="${CLAUDE_GUARD_STATE:-$HOME/.local/state/claude-guard}"
+LOG="$STATE_DIR/watchdog.log"
+WEB_BLOCK_FILE="$STATE_DIR/web-blocked-ips"
+REGION_STATE="$STATE_DIR/watch-last-region-ts"
+CLAUDE_LOGS_DIR="${CLAUDE_GUARD_LOGS_DIR:-$HOME/.config/Claude/logs}"
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+INTERVAL="${WATCH_INTERVAL:-15}"
+THRESHOLD="${WATCH_THRESHOLD:-2}"
+PROBE_EVERY="${WATCH_PROBE_EVERY:-10}"
+FORCE_DOWN="${WATCH_FORCE_DOWN:-0}"
+FORCE_REGION="${WATCH_FORCE_REGION:-0}"
+KILL="${WATCH_KILL:-1}"
+DRY="${WATCH_DRY:-0}"
+ONCE="${WATCH_ONCE:-0}"
+VPN_IFACE_RE="${CLAUDE_GUARD_IFACE_RE:-^(tun|tap|wg|ppp|utun|ipsec|proton|nordlynx|mullvad|sing|nevpn|happ)}"
+REGION_RE='region_unavailable|not available in your region'
+REGION_STALE=900    # вердикт старше этого возраста не относим к текущему выходу
+
+for a in "$@"; do
+  case "$a" in
+    --once)    ONCE=1 ;;
+    --dry-run) DRY=1 ;;
+    --help|-h) sed -n '2,16p' "$0"; exit 0 ;;
+  esac
+done
+
+# В одноразовом прогоне действуем по первому же замеру, иначе порог 2 недостижим.
+if [ "$ONCE" = "1" ] && [ -z "${WATCH_THRESHOLD:-}" ]; then THRESHOLD=1; fi
+
+logline() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+    notify-send -u critical -a claude-guard "$1" "$2" >/dev/null 2>&1 || true
+  fi
+}
+
+build_patterns() {
+  if [ -n "${WATCH_PATTERNS:-}" ]; then echo "$WATCH_PATTERNS"; return; fi
+  local pats=("claude-code/bin/claude.exe" "claude-code-linux-x64/claude" "claude-code-darwin")
+  local rf="$STATE_DIR/real-claude"
+  [ -s "$rf" ] && pats+=("$(cat "$rf")")
+  local p
+  for p in /usr/lib/claude-desktop/claude-desktop /usr/bin/claude-desktop \
+           /opt/Claude/claude-desktop "$HOME/.local/bin/claude-desktop.real"; do
+    [ -e "$p" ] && pats+=("$p")
+  done
+  local IFS='|'; echo "${pats[*]}"
+}
+PATTERNS="$(build_patterns)"
+
+vpn_iface() {
+  ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E "$VPN_IFACE_RE" | head -1
+}
+route_iface() {
+  ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1
+}
+
+tunnel_ok() {
+  [ "$FORCE_DOWN" = "1" ] && return 1
+  local vi ri
+  vi="$(vpn_iface)"; ri="$(route_iface)"
+  # нет VPN-интерфейсов вообще (proxy-only схема) — решает проверка страны в claude-guard
+  [ -z "$vi" ] && return 0
+  [ "$ri" = "$vi" ]
+}
+
+# Самый свежий вердикт Anthropic из логов Claude Desktop (unix-время или 0)
+newest_region_ts() {
+  local f line ts t newest=0
+  for f in "$CLAUDE_LOGS_DIR/main.log" "$CLAUDE_LOGS_DIR/claude.ai-web.log"; do
+    [ -f "$f" ] || continue
+    while IFS= read -r line; do
+      ts=$(printf '%s' "$line" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}')
+      [ -z "$ts" ] && continue
+      t=$(date -d "$ts" +%s 2>/dev/null) || continue
+      [ "$t" -gt "$newest" ] && newest=$t
+    done < <(grep -hE "$REGION_RE" "$f" 2>/dev/null | tail -20)
+  done
+  echo "$newest"
+}
+
+# 0 = появилась НОВАЯ и при этом СВЕЖАЯ жалоба Anthropic.
+# Старые жалобы (могли быть получены на другом выходе) только фиксируем в
+# состоянии, чтобы не принять их за новые, но Claude из-за них не гасим.
+region_verdict_new() {
+  [ "$FORCE_REGION" = "1" ] && return 0
+  local newest last now age
+  newest=$(newest_region_ts)
+  [ "$newest" = "0" ] && return 1
+  last=$(cat "$REGION_STATE" 2>/dev/null || echo 0)
+  [ "$newest" -gt "$last" ] || return 1
+  now=$(date +%s); age=$((now - newest))
+  if [ "$age" -le "$REGION_STALE" ]; then return 0; fi
+  printf '%s\n' "$newest" >"$REGION_STATE" 2>/dev/null
+  logline "stale anthropic verdict ignored (age=${age}s)"
+  return 1
+}
+
+current_ip() {
+  curl -s --noproxy '*' --max-time 10 https://ipinfo.io/ip 2>/dev/null | tr -d '\r\n ' | head -c 45
+}
+
+record_blocked_ip() {
+  local ip="$1"
+  [ -z "$ip" ] && return 0
+  grep -q "^${ip} " "$WEB_BLOCK_FILE" 2>/dev/null && return 0
+  echo "$ip $(date +%s)" >>"$WEB_BLOCK_FILE" 2>/dev/null || true
+}
+
+victims() {
+  local pat pid
+  IFS='|' read -ra pat <<<"$PATTERNS"
+  for p in "${pat[@]}"; do
+    [ -z "$p" ] && continue
+    for pid in $(pgrep -f -- "$p" 2>/dev/null); do
+      [ "$pid" = "$$" ] && continue
+      [ "$pid" = "$PPID" ] && continue
+      grep -qa 'claude-desktop-watchdog\|claude-desktop-guard\|claude-guard' "/proc/$pid/cmdline" 2>/dev/null && continue
+      echo "$pid"
+    done
+  done | sort -u
+}
+
+kill_claude() {
+  local reason="${1:-tunnel}" v n
+  v=$(victims)
+  [ -z "$v" ] && { [ "$DRY" = "1" ] && echo "DRY-RUN: жертв нет"; return 0; }
+  n=$(printf '%s\n' "$v" | wc -l)
+  if [ "$DRY" = "1" ]; then
+    echo "DRY-RUN ($reason): ПОГАСИЛ БЫ $n процессов: $(printf '%s ' $v)"
+    return 0
+  fi
+  if [ "$KILL" = "0" ]; then
+    notify "VPN/регион" "Claude работает при проблеме ($reason, $n процессов). WATCH_KILL=0 — закрой вручную."
+    echo "проблема ($reason), процессов Claude: $n (WATCH_KILL=0 — не гашу)"
+    logline "kill disabled reason=$reason victims=$n"
+    return 0
+  fi
+  logline "kill reason=$reason -> $n procs: $(printf '%s ' $v)"
+  printf '%s\n' "$v" | xargs -r kill -TERM 2>/dev/null
+  sleep 5
+  local left=""
+  for pid in $v; do kill -0 "$pid" 2>/dev/null && left="$left $pid"; done
+  [ -n "$left" ] && printf '%s\n' $left | xargs -r kill -KILL 2>/dev/null
+  if [ "$reason" = "region" ]; then
+    notify "Claude остановлен" "Anthropic не принимает текущий выход VPN (region_unavailable). Смени узел."
+    echo "Anthropic отклонил выход — погашено процессов: $n"
+  else
+    notify "Claude остановлен" "Пропал VPN-туннель. Claude закрыт, чтобы не выйти из РФ."
+    echo "Туннель пропал — погашено процессов: $n"
+  fi
+  return 0
+}
+
+handle_region_verdict() {
+  local ip newest
+  newest=$(newest_region_ts)
+  [ "$newest" = "0" ] && newest=$(date +%s)
+  ip=$(current_ip)
+  if [ "$DRY" = "1" ]; then
+    echo "DRY-RUN (region): жалоба Anthropic, выход=${ip:-?}, процессы: $(victims | tr '\n' ' ')"
+    return 0
+  fi
+  printf '%s\n' "$newest" >"$REGION_STATE" 2>/dev/null
+  record_blocked_ip "$ip"
+  logline "anthropic verdict=region_unavailable ip=${ip:-?} -> marking exit as blocked"
+  kill_claude region
+}
+
+fails=0
+cycles=0
+logline "watchdog start (interval=${INTERVAL}s threshold=${THRESHOLD} kill=${KILL} patterns=${PATTERNS})"
+
+while :; do
+  cycles=$((cycles + 1))
+  ok=1
+
+  if ! tunnel_ok; then
+    ok=0
+  elif [ "$PROBE_EVERY" -gt 0 ] && [ $((cycles % PROBE_EVERY)) -eq 0 ]; then
+    "$GUARD" --check >/dev/null 2>&1 || ok=0
+  fi
+
+  if [ "$ok" = "1" ]; then
+    fails=0
+  else
+    fails=$((fails + 1))
+    logline "check failed ($fails/$THRESHOLD), force_down=$FORCE_DOWN"
+  fi
+
+  if [ "$fails" -ge "$THRESHOLD" ]; then
+    kill_claude tunnel
+    fails=0
+  fi
+
+  # Вердикт Anthropic (region_unavailable) — независимый от туннеля сигнал
+  if region_verdict_new; then
+    handle_region_verdict
+  fi
+
+  [ "$ONCE" = "1" ] && exit 0
+  sleep "$INTERVAL"
+done

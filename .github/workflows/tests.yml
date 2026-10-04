@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux-ветка (bash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Прогон тестов стража и сторожа (в песочнице)
+        run: ./tests/bash-tests.sh
+
+  windows-logic:
+    name: Windows-ветка (PowerShell-логика)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Версия PowerShell
+        run: pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+      - name: Прогон харнесса (шин, симуляции, вердикт Anthropic, гашение процессов)
+        run: pwsh -NoProfile -File tests/win-guard-harness.ps1

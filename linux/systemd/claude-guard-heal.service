@@ -1,0 +1,7 @@
+[Unit]
+Description=claude-guard: починка обёртки Claude Code (после npm-обновлений)
+Documentation=file://%h/.local/bin/claude-guard
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-guard --install
