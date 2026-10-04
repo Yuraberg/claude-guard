@@ -11,7 +11,7 @@
 | `tests/unit-thresholds.sh` | пороги времени Linux-ветки — изолированно, без сети | `./tests/unit-thresholds.sh` | 25 |
 | `tests/linux-install-e2e.sh` | установку и снятие в изолированном `HOME` (режим `--no-systemd`) | `./tests/linux-install-e2e.sh` | 21 (без Claude Desktop часть шагов SKIP) |
 | `tests/unit-thresholds.ps1` | пороги времени Windows-ветки — изолированно, без сети | `pwsh -NoProfile -File tests/unit-thresholds.ps1` | 29 |
-| `tests/win-guard-harness.ps1` | Windows-ветку без Windows: кодировка `.ps1` (BOM), шим (CRLF/ASCII), симуляции, вердикт, гашение процессов | `pwsh -NoProfile -File tests/win-guard-harness.ps1` | 32 |
+| `tests/win-guard-harness.ps1` | Windows-ветку без Windows: кодировка `.ps1` (BOM), шим (CRLF/ASCII), симуляции, вердикт, гашение процессов | `pwsh -NoProfile -File tests/win-guard-harness.ps1` | 33 |
 | `tests/win-e2e.ps1` | установку на **настоящей Windows**: Планировщик, `PATH` в реестре, `Get-NetAdapter`/`Find-NetRoute`, ярлык, снятие | `powershell -File tests/win-e2e.ps1` | 31 |
 
 ## Юнит-тесты порогов (без сети)
@@ -115,7 +115,7 @@ Windows-специфику он не пытается.
 - `windows-logic` (Ubuntu + предустановленный PowerShell) — `tests/unit-thresholds.ps1`,
   затем харнесс. Установленного Claude Code в CI нет, поэтому харнесс подкладывает
   синтетический ELF > 1 МБ и единственную зависящую от него проверку помечает `SKIP`
-  (31 выполняется, 1 пропускается, провалов быть не должно);
+  (32 выполняется, 1 пропускается, провалов быть не должно);
 - `windows-native` (`windows-latest`) — `tests/win-e2e.ps1` на живой Windows.
 
 ## Правила безопасности при тестах

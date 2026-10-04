@@ -9,7 +9,7 @@
 | `unit-thresholds.sh` | пороги времени Linux-ветки изолированно: свежесть/устаревание жалоб, память плохих IP, 403 | `./unit-thresholds.sh` |
 | `linux-install-e2e.sh` | установку и снятие в изолированном `HOME` (`install.sh --no-systemd`, как в WSL) — 21 проверка | `./linux-install-e2e.sh` |
 | `unit-thresholds.ps1` | то же для Windows-ветки (`../windows/`) — логика порогов без Windows | `pwsh -NoProfile -File unit-thresholds.ps1` |
-| `win-guard-harness.ps1` | Windows-ветку: 32 проверки — кодировка `.ps1` (UTF-8 BOM), шим (CRLF/ASCII), симуляции, вердикт, гашение процессов | `pwsh -NoProfile -File win-guard-harness.ps1` |
+| `win-guard-harness.ps1` | Windows-ветку: 33 проверки — кодировка `.ps1` (UTF-8 BOM), шим (CRLF/ASCII), симуляции, вердикт, гашение процессов | `pwsh -NoProfile -File win-guard-harness.ps1` |
 | `win-e2e.ps1` | установку на **настоящей** Windows: Планировщик задач, `PATH` в реестре, `Get-NetAdapter` / `Find-NetRoute`, ярлык, снятие | `powershell -File win-e2e.ps1` |
 
 Все прогоны, кроме `win-e2e.ps1`, работают в песочнице: bash-тесты — через
@@ -35,6 +35,6 @@
 
 В CI (GitHub Actions) установленного Claude Code нет, поэтому харнесс подкладывает
 синтетический исполняемый ELF > 1 МБ и единственную зависящую от него проверку помечает
-`SKIP`; остальные 31 выполняются.
+`SKIP`; остальные 32 выполняются.
 
 Подробности и правила безопасности — [`../docs/testing.md`](../docs/testing.md).

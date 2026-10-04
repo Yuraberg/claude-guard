@@ -15,12 +15,14 @@ $GuardFile = Join-Path $WinDir 'claude-guard.ps1'
 $WatchFile = Join-Path $WinDir 'claude-watchdog.ps1'
 $fails = 0
 $skips = 0
+$checks = 0
 function Check([string]$Name, [bool]$Ok, [string]$Detail = '') {
+    $script:checks++
     if ($Ok) { Write-Host "PASS  $Name" -ForegroundColor Green }
     else { Write-Host "FAIL  $Name  $Detail" -ForegroundColor Red; $script:fails++ }
 }
 function Skip([string]$Name, [string]$Why) {
-    Write-Host "SKIP  $Name  ($Why)" -ForegroundColor Yellow; $script:skips++
+    Write-Host "SKIP  $Name  ($Why)" -ForegroundColor Yellow; $script:skips++; $script:checks++
 }
 
 Write-Host "=== 1. Синтаксис .ps1 ==="
@@ -196,5 +198,5 @@ Check 'сторож: симуляция жалобы (CLAUDE_GUARD_FORCE_REGION)
 $env:CLAUDE_GUARD_FORCE_REGION = ''
 
 Write-Host ''
-Write-Host ("ИТОГ: провалов $fails, пропущено $skips") -ForegroundColor $(if ($fails -eq 0) { 'Green' } else { 'Red' })
+Write-Host ("ИТОГ: проверок $checks, провалов $fails, пропущено $skips") -ForegroundColor $(if ($fails -eq 0) { 'Green' } else { 'Red' })
 exit $fails

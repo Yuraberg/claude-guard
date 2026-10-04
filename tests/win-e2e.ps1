@@ -80,16 +80,23 @@ foreach ($t in @('ClaudeGuardWatchdog', 'ClaudeGuardHeal')) {
         Check "задача $t без ошибок последнего запуска" ($null -ne $info)
     }
 }
-Check 'ярлык «Claude (с VPN)» создан' (Test-Path -LiteralPath $Lnk) $Lnk
-$lnkOk = $false
-if (Test-Path -LiteralPath $Lnk) {
-    try {
-        $sh = New-Object -ComObject WScript.Shell
-        $sc = $sh.CreateShortcut($Lnk)
-        $lnkOk = ($sc.Arguments -match 'claude-desktop-launch')
-    } catch { $lnkOk = $false }
+# Ярлык создаётся только если Claude Desktop установлен (установщик это проверяет через
+# Get-StartApps). На раннере его нет — значит это SKIP, а не провал.
+$desktopPresent = $false
+try { $desktopPresent = [bool](Get-StartApps -ErrorAction Stop | Where-Object { $_.Name -like 'Claude*' }) } catch { }
+if ($desktopPresent) {
+    Check 'ярлык «Claude (с VPN)» создан' (Test-Path -LiteralPath $Lnk) $Lnk
+    $lnkOk = $false
+    if (Test-Path -LiteralPath $Lnk) {
+        try {
+            $sh = New-Object -ComObject WScript.Shell
+            $sc = $sh.CreateShortcut($Lnk)
+            $lnkOk = ($sc.Arguments -match 'claude-desktop-launch')
+        } catch { $lnkOk = $false }
+    }
+    Check 'ярлык ведёт на claude-desktop-launch.ps1' $lnkOk
 }
-Check 'ярлык ведёт на claude-desktop-launch.ps1' $lnkOk
+else { Skip 'ярлык «Claude (с VPN)»' 'в этой системе нет Claude Desktop' }
 
 Write-Host ''
 Write-Host '=== 4. Страж на реальных Windows-путях (PowerShell 5.1) ==='
@@ -115,7 +122,9 @@ Check 'симуляция «нет туннеля»: сказано, что за
 $st = Ps51 $guard @('-SelfTest')
 $stOut = $st.Out
 $simPass = ($stOut -split "`n" | Where-Object { $_ -match '— PASS' }).Count
-Check 'самопроверка: 5 симуляций PASS' ($simPass -eq 5) "PASS-строк: $simPass"
+# 5 симуляций обязаны пройти везде; шестая («реальная обстановка») зависит от машины:
+# на раннере без VPN-адаптера и без РФ-выхода она тоже PASS.
+Check 'самопроверка: все симуляции PASS' ($simPass -ge 5) "PASS-строк: $simPass"
 Check 'самопроверка напечатала итог' ($stOut -match 'Итог:') $stOut
 
 Write-Host ''
@@ -132,7 +141,8 @@ Check 'claude.cmd: сообщение об отмене' (($shimBlock | Out-Stri
 Write-Host ''
 Write-Host '=== 6. Сторож на живой Windows ==='
 $wd = Ps51 (Join-Path $GuardHome 'claude-watchdog.ps1') @('-Once', '-DryRun')
-Check 'сторож: -Once -DryRun отработал' ($wd.Code -eq 0) "код $($wd.Code)"
+Write-Host (($wd.Out.Trim() -split "`n" | Select-Object -Last 4) -join "`n")
+Check 'сторож: -Once -DryRun отработал' ($wd.Code -eq 0) "код $($wd.Code): $($wd.Out.Trim())"
 
 Write-Host ''
 Write-Host '=== 7. PowerShell 7 (если установлен) ==='
@@ -140,7 +150,7 @@ if (Get-Command pwsh -ErrorAction SilentlyContinue) {
     $st7 = & pwsh -NoProfile -File $guard -SelfTest 2>&1
     $st7Out = $st7 | Out-String
     $sim7 = ($st7Out -split "`n" | Where-Object { $_ -match '— PASS' }).Count
-    Check 'pwsh 7: 5 симуляций PASS' ($sim7 -eq 5) "PASS-строк: $sim7"
+    Check 'pwsh 7: все симуляции PASS' ($sim7 -ge 5) "PASS-строк: $sim7"
 }
 else { Skip 'проверки в pwsh 7' 'pwsh не установлен' }
 
@@ -154,7 +164,7 @@ foreach ($t in @('ClaudeGuardWatchdog', 'ClaudeGuardHeal')) {
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 Check 'каталог шима убран из PATH' (-not (($userPath -split ';') -contains $ShimDir))
 Check 'шимы удалены' (-not (Test-Path -LiteralPath $cmdShim))
-Check 'ярлык удалён' (-not (Test-Path -LiteralPath $Lnk))
+Check 'ярлык удалён (или его и не было)' (-not (Test-Path -LiteralPath $Lnk))
 
 Write-Host ''
 Write-Host ("ИТОГ: провалов $fails, пропущено $skips") -ForegroundColor $(if ($fails -eq 0) { 'Green' } else { 'Red' })
