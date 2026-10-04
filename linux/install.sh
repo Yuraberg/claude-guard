@@ -60,10 +60,18 @@ detect_desktop_entry() {
 uninstall_all() {
   say "Снятие claude-guard"
   [ -x "$BIN_DIR/claude-guard" ] && "$BIN_DIR/claude-guard" --uninstall || true
-  systemctl --user disable --now claude-desktop-tunnel-guard.service 2>/dev/null || true
-  systemctl --user disable --now claude-guard-heal.timer 2>/dev/null || true
+  # ВАЖНО: systemctl --user не изолируется подменой HOME — он всегда один на пользователя.
+  # Поэтому службы трогаем только если systemd обслуживает именно этот HOME (иначе это
+  # чужой дом, например песочница тестов) — иначе снятие в песочнице гасит защиту на
+  # рабочей машине.
+  if systemd_ours; then
+    systemctl --user disable --now claude-desktop-tunnel-guard.service 2>/dev/null || true
+    systemctl --user disable --now claude-guard-heal.timer 2>/dev/null || true
+    systemctl --user daemon-reload 2>/dev/null || true
+  else
+    say "  (systemd этого HOME не обслуживает — службы не трогаю)"
+  fi
   rm -f "$UNIT_DIR/claude-desktop-tunnel-guard.service" "$UNIT_DIR/claude-guard-heal.service" "$UNIT_DIR/claude-guard-heal.timer"
-  systemctl --user daemon-reload 2>/dev/null || true
   rm -f "$APP_DIR/com.anthropic.Claude.desktop"
   if [ -f /usr/share/applications/com.anthropic.Claude.desktop ]; then
     say "Системный .desktop на месте — запуск Desktop вернулся к обычному."

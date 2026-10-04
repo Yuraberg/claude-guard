@@ -62,12 +62,22 @@ ok "диагностика --status работает из установленн
 
 echo
 echo "=== снятие ==="
-"$ROOT/linux/install.sh" --uninstall >/dev/null 2>&1
+# --no-systemd обязателен: systemctl --user не изолируется подменой HOME, и без флага
+# снятие в песочнице отключило бы сторож на рабочей машине (уже случалось).
+"$ROOT/linux/install.sh" --no-systemd --uninstall >/dev/null 2>&1
 ok "снятие завершилось" test $? -eq 0
 ok "страж снят из ~/.local/bin" test ! -e "$HOME/.local/bin/claude-guard"
 ok "сторож снят" test ! -e "$HOME/.local/bin/claude-desktop-watchdog"
 ok "переопределение .desktop снято" test ! -e "$HOME/.local/share/applications/com.anthropic.Claude.desktop"
 ok "логи остались на месте (не удаляем молча)" test -d "$HOME/.local/state/claude-guard"
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  st="$(systemctl --user is-enabled claude-desktop-tunnel-guard.service 2>/dev/null)"
+  if [ "$st" = "enabled" ] || [ "$st" = "disabled" ]; then
+    pass "службы рабочего HOME не тронуты снятием в песочнице"
+  else
+    fail "состояние службы рабочего HOME не читается" "$st"
+  fi
+fi
 
 echo
 if [ "$fails" = 0 ]; then echo "ИТОГ: все проверки пройдены"; else echo "ИТОГ: провалов $fails"; fi

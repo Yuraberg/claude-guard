@@ -81,3 +81,9 @@
 24. **Windows-специфику нельзя доказать эмуляцией.** `Get-NetAdapter`, `Find-NetRoute`,
     `Register-ScheduledTask`, `PATH` в реестре проверяются только на настоящей Windows
     (джоб `windows-native`, `tests/win-e2e.ps1`); в прогоне под Linux они честно пропускаются.
+
+25. **`systemctl --user` не изолируется подменой `HOME`.** E2E установки/снятия в песочном
+    `HOME` вызвал `install.sh --uninstall`, тот выполнил `systemctl --user disable --now` — и
+    **остановил сторож на рабочей машине** (`is-active` → inactive, `is-enabled` → disabled,
+    защита молча выключена). Дом у systemd один на пользователя: службами управлять только
+    когда `systemd_ours` подтверждает совпадение `HOME`, а в тестах — `--no-systemd`.
