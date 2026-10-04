@@ -1,5 +1,8 @@
 # claude-guard
 
+![tests](https://github.com/Yuraberg/claude-guard/actions/workflows/tests.yml/badge.svg)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Запускает **Claude Code** и **Claude Desktop** только тогда, когда трафик гарантированно
 уходит вне РФ **и** Anthropic принимает текущий выход. Иначе — отказ запуска, а уже
 работающий Claude закрывается сторожем. Политика **fail-closed**: любая неясность
