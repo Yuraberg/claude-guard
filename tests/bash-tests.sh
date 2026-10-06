@@ -88,6 +88,55 @@ check_net "после сброса: --check пропускает" 0 "$BIN/claude
 check_out "--status показывает вердикт Anthropic" 'вердикт Anthropic' "$BIN/claude-guard" --status
 
 echo
+echo "=== пробники выхода: цепочка без лимитов ==="
+BROKEN='http://127.0.0.1:9/x'
+check_net "живой прогон: --check проходит" 0 "$BIN/claude-guard" --check
+grep -q 'src=trace' "$CLAUDE_GUARD_STATE/guard.log" \
+  && pass "журнал: источник пробы = trace (не ipinfo с лимитами)" || fail "журнал: источник пробы не виден"
+# Запасной пробник проверяем герметично: тело ответа берём из каталога-фикстуры
+# (тестовый шов PROBE_FIXTURE) — важно именно то, что цепочка падает на следующий
+# пробник, а не наличие сети в момент прогона.
+mkdir -p "$SB/fixture"
+printf 'fl=test\nip=198.51.100.7\nts=1\nloc=US\n' >"$SB/fixture/trace"
+check_net "основной пробник недоступен → сработал запасной" 0 \
+  env CLAUDE_GUARD_PROBE_FIXTURE="$SB/fixture" CLAUDE_GUARD_PROBE_PRIMARY="$BROKEN" \
+      "$BIN/claude-guard" --check
+check "фикстура: нет файла пробника → «не ответил» → отказ" 1 \
+  env CLAUDE_GUARD_PROBE_FIXTURE="$SB/empty-fixture" CLAUDE_GUARD_PROBE_PRIMARY="$BROKEN" \
+      "$BIN/claude-guard" --check
+check "ни один пробник не отвечает → отказ (fail-closed)" 1 \
+  env CLAUDE_GUARD_PROBE_PRIMARY="$BROKEN" CLAUDE_GUARD_PROBE_SECONDARY="$BROKEN" \
+      CLAUDE_GUARD_PROBE_JSON="$BROKEN" "$BIN/claude-guard" --check
+grep -q 'reason=no-answer' "$CLAUDE_GUARD_STATE/guard.log" \
+  && pass "журнал: причина = no-answer (а не «нет туннеля»)" || fail "журнал: причина не no-answer"
+check_out "текст отказа говорит о пробе, а не о VPN" 'ни один пробник выхода не ответил' \
+  env CLAUDE_GUARD_PROBE_PRIMARY="$BROKEN" CLAUDE_GUARD_PROBE_SECONDARY="$BROKEN" \
+      CLAUDE_GUARD_PROBE_JSON="$BROKEN" "$BIN/claude-guard" --check
+
+FAKE="$SB/fakebin"; mkdir -p "$FAKE"; rm -f "$SB/calls"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s/calls"\n' "$SB" >"$FAKE/notify-send"
+chmod +x "$FAKE/notify-send"
+env PATH="$FAKE:$PATH" WAYLAND_DISPLAY=x DISPLAY= CLAUDE_GUARD_QUIET=1 \
+    CLAUDE_GUARD_PROBE_PRIMARY="$BROKEN" CLAUDE_GUARD_PROBE_SECONDARY="$BROKEN" \
+    CLAUDE_GUARD_PROBE_JSON="$BROKEN" "$BIN/claude-guard" --check >/dev/null 2>&1
+[ ! -s "$SB/calls" ] && pass "QUIET: фоновая проверка не шлёт уведомлений" \
+                     || fail "QUIET: уведомление всё равно ушло" "$(cat "$SB/calls")"
+env PATH="$FAKE:$PATH" WAYLAND_DISPLAY=x DISPLAY= \
+    CLAUDE_GUARD_PROBE_PRIMARY="$BROKEN" CLAUDE_GUARD_PROBE_SECONDARY="$BROKEN" \
+    CLAUDE_GUARD_PROBE_JSON="$BROKEN" "$BIN/claude-guard" --check >/dev/null 2>&1
+if grep -q 'проба выхода не ответила' "$SB/calls" 2>/dev/null; then
+  pass "ручной запуск: уведомление с фактической причиной"
+else
+  fail "ручной запуск: текст уведомления не про причину" "$(head -1 "$SB/calls" 2>/dev/null)"
+fi
+
+env WATCH_DRY=1 WATCH_PROBE_EVERY=1 \
+    CLAUDE_GUARD_PROBE_PRIMARY="$BROKEN" CLAUDE_GUARD_PROBE_SECONDARY="$BROKEN" \
+    CLAUDE_GUARD_PROBE_JSON="$BROKEN" "$BIN/claude-desktop-watchdog" --once --dry-run >/dev/null 2>&1
+grep -q 'guard check failed .* reason=no-answer' "$CLAUDE_GUARD_STATE/watchdog.log" \
+  && pass "сторож: назвал причину провала (no-answer)" || fail "сторож: причина не записана"
+
+echo
 echo "=== сторож (dry-run, ничего не гасит) ==="
 fresh_region_log
 check_out "свежая жалоба → DRY-RUN region" 'DRY-RUN \(region\)' \

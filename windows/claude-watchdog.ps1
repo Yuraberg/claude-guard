@@ -40,6 +40,16 @@ $Interval  = if ($env:CLAUDE_GUARD_INTERVAL) { [int]$env:CLAUDE_GUARD_INTERVAL }
 $Threshold = if ($env:CLAUDE_GUARD_THRESHOLD) { [int]$env:CLAUDE_GUARD_THRESHOLD } else { 2 }
 if ($Once -and -not $env:CLAUDE_GUARD_THRESHOLD) { $Threshold = 1 }
 $ProbeEvery = if ($env:CLAUDE_GUARD_PROBE_EVERY) { [int]$env:CLAUDE_GUARD_PROBE_EVERY } else { 10 }
+# Провалы полной проверки стража гасим только после нескольких подряд: одиночная
+# неудачная проба (сеть/переподключение) — не повод закрывать Claude.
+$GuardThreshold = if ($env:CLAUDE_GUARD_WATCH_THRESHOLD) { [int]$env:CLAUDE_GUARD_WATCH_THRESHOLD } else { 4 }
+if ($Once -and -not $env:CLAUDE_GUARD_WATCH_THRESHOLD) { $GuardThreshold = 1 }
+# Cloudflare trace: без лимитов (ipinfo.io отдаёт 429 и показывал пустоту)
+$ProbeTraceUrl = if ($env:CLAUDE_GUARD_WATCH_TRACE) { $env:CLAUDE_GUARD_WATCH_TRACE } else { 'https://1.1.1.1/cdn-cgi/trace' }
+$LastReasonFile = Join-Path $StateDir 'last-reason'
+# Чем запускать стража. На Windows это powershell.exe (5.1) — как и было; переменная
+# нужна тестам (харнесс подставляет свой pwsh, чтобы прогнать ветку с причиной).
+$PsExe = if ($env:CLAUDE_GUARD_PS_EXE) { $env:CLAUDE_GUARD_PS_EXE } else { 'powershell.exe' }
 $Kill = ($env:CLAUDE_GUARD_WATCH_KILL -ne '0')
 $ForceDown = ($env:CLAUDE_GUARD_FORCE_DOWN -eq '1')
 $VpnPattern = 'WireGuard|Wintun|TAP-|Tap-Windows|OpenVPN|NordLynx|Proton|Mullvad|Happ|sing-box|Amnezia|Outline|Shadowsocks|Hiddify|Tunnel|VPN|TUN'
@@ -153,22 +163,21 @@ function Test-RegionVerdictNew {
 }
 
 function Get-ExitIp {
-    # Только адреса, идущие через туннель (ipify/checkip сплит отправляет напрямую).
+    # Cloudflare trace: без лимитов (ipinfo.io отдаёт 429 и показывал пустоту,
+    # из-за чего выход «не находился» при живом туннеле).
     foreach ($attempt in 1..2) {
-        foreach ($url in @('https://ipinfo.io/ip', 'https://ifconfig.co/ip')) {
-            try {
-                $req = [System.Net.WebRequest]::Create($url)
-                $req.Timeout = $ProbeTimeoutMs
-                $req.UserAgent = 'claude-guard'
-                $req.Proxy = $null
-                $resp = $req.GetResponse()
-                $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-                $body = $reader.ReadToEnd().Trim()
-                $reader.Close(); $resp.Close()
-                if ($body -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') { return $body }
-            } catch { }
-        }
-        if ($attempt -eq 1) { Start-Sleep -Seconds 2 }
+        try {
+            $req = [System.Net.WebRequest]::Create($ProbeTraceUrl)
+            $req.Timeout = $ProbeTimeoutMs
+            $req.UserAgent = 'claude-guard'
+            $req.Proxy = $null
+            $resp = $req.GetResponse()
+            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $body = $reader.ReadToEnd()
+            $reader.Close(); $resp.Close()
+            if ($body -match '(?m)^ip=([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') { return $Matches[1] }
+        } catch { }
+        if ($attempt -eq 1) { Start-Sleep -Seconds 1 }
     }
     return ''
 }
@@ -239,42 +248,67 @@ function Invoke-Down {
     }
     Write-Log "kill reason=$Reason -> $($victims.Count): $ids"
     foreach ($v in $victims) { try { Stop-Process -Id $v.Id -Force -ErrorAction Stop } catch { } }
-    if ($Reason -eq 'region') {
-        Write-Host "Anthropic отклонил выход — погашено процессов: $($victims.Count)"
-        Show-Balloon 'Claude остановлен' 'Anthropic не принимает текущий выход VPN (region_unavailable). Смени узел.'
+    switch ($Reason) {
+        'region' { Show-Balloon 'Claude остановлен' 'Anthropic не принимает текущий выход VPN (region_unavailable). Смени узел.' }
+        'tunnel' { Show-Balloon 'Claude остановлен' 'Пропал VPN-туннель. Claude закрыт, чтобы не выйти из РФ.' }
+        'guard:no-answer' { Show-Balloon 'Claude остановлен' "Проба выхода не отвечает $Threshold проверок подряд. Claude закрыт — проверь VPN/сеть." }
+        'guard:country' { Show-Balloon 'Claude остановлен' "Выход идёт из РФ $Threshold проверок подряд. Claude закрыт — включи/переключи VPN." }
+        'guard:ipv6' { Show-Balloon 'Claude остановлен' 'Утечка IPv6 мимо туннеля. Claude закрыт.' }
+        'guard:anthropic' { Show-Balloon 'Claude остановлен' 'Anthropic не принимает этот выход VPN. Claude закрыт — смени узел.' }
+        default { Show-Balloon 'Claude остановлен' "Проверка не пройдена ($Reason). Claude закрыт." }
     }
-    else {
-        Write-Host "VPN пропал — погашено процессов: $($victims.Count)"
-        Show-Balloon 'Claude остановлен' 'Пропал VPN. Claude закрыт, чтобы не выйти из РФ.'
-    }
+    Write-Host "Погашено процессов: $($victims.Count) (причина: $Reason)"
 }
 
-$fails = 0
+$fails = 0      # провалы проверки туннеля подряд
+$gfails = 0     # провалы полной проверки стража подряд (страна/проба/Anthropic)
 $cycles = 0
-Write-Log "watchdog start (interval=${Interval}s threshold=$Threshold kill=$Kill force_down=$ForceDown dry=$DryRun)"
+$guardMissingLogged = $false
+Write-Log "watchdog start (interval=${Interval}s threshold=$Threshold guard_threshold=$GuardThreshold kill=$Kill force_down=$ForceDown dry=$DryRun)"
 
 while ($true) {
     $cycles++
-    $ok = $true
+    $tunnelBad = $false
+    $guardBad = ''
+
     if (-not (Test-Tunnel)) {
-        $ok = $false
+        $tunnelBad = $true
     }
     elseif ($ProbeEvery -gt 0 -and ($cycles % $ProbeEvery) -eq 0) {
         if (Test-Path $GuardPs1) {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $GuardPs1 -Check *> $null
-            if ($LASTEXITCODE -ne 0) { $ok = $false }
+            # QUIET: уведомления шлёт только сторож, и только по факту гашения — иначе
+            # каждая фоновая проверка давала пользователю «нет VPN» при живом туннеле.
+            $env:CLAUDE_GUARD_QUIET = '1'
+            try {
+                & $PsExe -NoProfile -ExecutionPolicy Bypass -File $GuardPs1 -Check *> $null
+                $rc = $LASTEXITCODE
+            }
+            finally { Remove-Item Env:\CLAUDE_GUARD_QUIET -ErrorAction SilentlyContinue }
+            if ($rc -ne 0) {
+                $guardBad = if (Test-Path $LastReasonFile) { (Get-Content -LiteralPath $LastReasonFile -Raw -ErrorAction SilentlyContinue).Trim() } else { '' }
+                if (-not $guardBad) { $guardBad = 'unknown' }
+            }
+        }
+        elseif (-not $guardMissingLogged) {
+            # Молча пропускать полную проверку нельзя: сторож остался бы с одной
+            # проверкой туннеля и не заметил утечки из РФ. Пишем след в журнал.
+            Write-Log "guard script not found: $GuardPs1 — полная проверка пропускается (запусти install.ps1)"
+            $guardMissingLogged = $true
         }
     }
 
-    if ($ok) { $fails = 0 }
-    else {
-        $fails++
-        Write-Log "check failed ($fails/$Threshold)"
+    if ($tunnelBad) {
+        $fails++; $gfails = 0
+        Write-Log "tunnel check failed ($fails/$Threshold), force_down=$ForceDown"
+        if ($fails -ge $Threshold) { Invoke-Down -Reason 'tunnel'; $fails = 0 }
     }
-
-    if ($fails -ge $Threshold) {
-        Invoke-Down -Reason 'tunnel'
-        $fails = 0
+    elseif ($guardBad) {
+        $fails = 0; $gfails++
+        Write-Log "guard check failed ($gfails/$GuardThreshold) reason=$guardBad"
+        if ($gfails -ge $GuardThreshold) { Invoke-Down -Reason "guard:$guardBad"; $gfails = 0 }
+    }
+    else {
+        $fails = 0; $gfails = 0
     }
 
     # Вердикт Anthropic (region_unavailable) — независимый от туннеля сигнал

@@ -7,11 +7,11 @@
 
 | Набор | Что проверяет | Запуск | Проверок |
 |---|---|---|---|
-| `tests/bash-tests.sh` | Linux-ветку целиком: синтаксис, шим, симуляции стража, вердикт Anthropic, сторож | `./tests/bash-tests.sh` | 29 |
+| `tests/bash-tests.sh` | Linux-ветку целиком: синтаксис, шим, симуляции стража, вердикт Anthropic, цепочка пробников, сторож | `./tests/bash-tests.sh` | 39 |
 | `tests/unit-thresholds.sh` | пороги времени Linux-ветки — изолированно, без сети | `./tests/unit-thresholds.sh` | 25 |
 | `tests/linux-install-e2e.sh` | установку и снятие в изолированном `HOME` (режим `--no-systemd`) | `./tests/linux-install-e2e.sh` | 21 (без Claude Desktop часть шагов SKIP) |
 | `tests/unit-thresholds.ps1` | пороги времени Windows-ветки — изолированно, без сети | `pwsh -NoProfile -File tests/unit-thresholds.ps1` | 29 |
-| `tests/win-guard-harness.ps1` | Windows-ветку без Windows: кодировка `.ps1` (BOM), шим (CRLF/ASCII), симуляции, вердикт, гашение процессов | `pwsh -NoProfile -File tests/win-guard-harness.ps1` | 33 |
+| `tests/win-guard-harness.ps1` | Windows-ветку без Windows: кодировка `.ps1` (BOM), шим (CRLF/ASCII), симуляции, вердикт, цепочка пробников, гашение процессов | `pwsh -NoProfile -File tests/win-guard-harness.ps1` | 40 |
 | `tests/win-e2e.ps1` | установку на **настоящей Windows**: Планировщик, `PATH` в реестре, `Get-NetAdapter`/`Find-NetRoute`, ярлык, снятие | `powershell -File tests/win-e2e.ps1` | 31 |
 
 ## Юнит-тесты порогов (без сети)
@@ -115,8 +115,22 @@ Windows-специфику он не пытается.
 - `windows-logic` (Ubuntu + предустановленный PowerShell) — `tests/unit-thresholds.ps1`,
   затем харнесс. Установленного Claude Code в CI нет, поэтому харнесс подкладывает
   синтетический ELF > 1 МБ и единственную зависящую от него проверку помечает `SKIP`
-  (32 выполняется, 1 пропускается, провалов быть не должно);
+  (39 выполняется, 1 пропускается, провалов быть не должно);
 - `windows-native` (`windows-latest`) — `tests/win-e2e.ps1` на живой Windows.
+
+## Цепочка пробников выхода (герметично, без сети)
+
+Проба выхода — три адреса подряд (`1.1.1.1/cdn-cgi/trace` → `claude.ai/cdn-cgi/trace` →
+`ipinfo.io/json`); проверяется, что при недоступности первых пробников цепочка идёт дальше,
+а когда не ответил ни один — отказ приходит с причиной `no-answer` (не «нет VPN»).
+Чтобы это не зависело от канала, есть тестовый шов: `CLAUDE_GUARD_PROBE_FIXTURE=<каталог>`
+подставляет тело ответа из файла с именем пробника (`trace` / `ipinfo`); нет файла — «не ответил».
+
+Обе ветки проверяют: запасной пробник выручает; ни один не ответил → код 1 и причина
+`no-answer`; текст отказа говорит о пробе; `src=` виден в `guard.log`; в фоне (`QUIET=1`)
+уведомлений нет, а при ручном запуске уведомление содержит фактическую причину; сторож
+берёт причину из `last-reason` (в Windows-харнессе — ещё и то, что пропавший файл стража
+не игнорируется молча).
 
 ## Правила безопасности при тестах
 

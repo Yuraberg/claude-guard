@@ -198,5 +198,57 @@ Check 'сторож: симуляция жалобы (CLAUDE_GUARD_FORCE_REGION)
 $env:CLAUDE_GUARD_FORCE_REGION = ''
 
 Write-Host ''
+Write-Host '=== 10. Пробники выхода: цепочка без лимитов ==='
+# ipinfo.io отдаёт HTTP 429 при частых запросах — проба уходила в «нет ответа» при
+# живом туннеле. Проверяем, что цепочка падает на запасной пробник и что причина
+# отказа называется честно (no-answer), а не «нет VPN».
+$broken = 'http://127.0.0.1:9/x'
+$stateDir = Join-Path $env:CLAUDE_GUARD_HOME 'state'
+$glog = Join-Path $stateDir 'guard.log'
+$wlog = Join-Path $stateDir 'watchdog.log'
+# чистим следы раздела 9: память о «плохом выходе» и метку вердикта
+Remove-Item -Force (Join-Path $stateDir 'web-blocked-ips') -ErrorAction SilentlyContinue
+Remove-Item -Force (Join-Path $stateDir 'watch-last-region-ts') -ErrorAction SilentlyContinue
+# сторож по умолчанию зовёт powershell.exe (Windows); в харнессе — свой pwsh
+$env:CLAUDE_GUARD_PS_EXE = $PwshExe
+
+# Локальный «выход»: тело ответа пробника берём из каталога-фикстуры (тестовый шов
+# CLAUDE_GUARD_PROBE_FIXTURE) — тест герметичен и проверяет разбор ip=/loc= в цепочке.
+$fixture = Join-Path $Sand 'fixture'
+New-Item -ItemType Directory -Force $fixture | Out-Null
+[IO.File]::WriteAllText((Join-Path $fixture 'trace'), "fl=test`nip=198.51.100.7`nts=1`nloc=US`n")
+$env:CLAUDE_GUARD_PROBE_FIXTURE = $fixture
+
+$env:CLAUDE_GUARD_PROBE_PRIMARY = $broken
+$null = & $PwshExe -NoProfile -File $GuardFile -Check 2>&1; $c = $LASTEXITCODE
+Check 'основной пробник недоступен → сработал запасной (страна определена)' ($c -eq 0) "код $c"
+
+$env:CLAUDE_GUARD_PROBE_SECONDARY = $broken
+$env:CLAUDE_GUARD_PROBE_JSON = $broken
+$out = & $PwshExe -NoProfile -File $GuardFile -Check 2>&1; $c = $LASTEXITCODE
+$msg = $out | Out-String
+Check 'ни один пробник не отвечает → отказ (fail-closed)' ($c -eq 1) "код $c"
+Check 'текст отказа говорит о пробе, а не о VPN' ($msg -match 'ни один пробник выхода не ответил') $msg.Substring(0, [Math]::Min(200, $msg.Length))
+Check 'журнал: причина = no-answer (а не «нет туннеля»)' ([bool](Select-String -Path $glog -Pattern 'reason=no-answer' -Quiet))
+Check 'журнал: виден источник пробы (src=)' ([bool](Select-String -Path $glog -Pattern 'src=' -Quiet))
+
+$env:CLAUDE_GUARD_PROBE_EVERY = '1'
+$env:CLAUDE_GUARD_WATCH_KILL = '0'
+
+# Штатный install.ps1 кладёт страж в $GuardHome — иначе сторож не находит его.
+# Сначала проверяем, что сторож честно пишет о пропуске, потом кладём файл.
+Remove-Item -Force (Join-Path $env:CLAUDE_GUARD_HOME 'claude-guard.ps1') -ErrorAction SilentlyContinue
+$null = & $PwshExe -NoProfile -File $WatchFile -Once -DryRun 2>&1
+Check 'сторож: стража нет → пишет в журнал (не молчит)' ([bool](Select-String -Path $wlog -Pattern 'guard script not found' -Quiet))
+
+Copy-Item -LiteralPath $GuardFile -Destination (Join-Path $env:CLAUDE_GUARD_HOME 'claude-guard.ps1') -Force
+$null = & $PwshExe -NoProfile -File $WatchFile -Once -DryRun 2>&1
+Check 'сторож: назвал причину провала (no-answer)' ([bool](Select-String -Path $wlog -Pattern 'guard check failed .* reason=no-answer' -Quiet))
+
+foreach ($v in 'CLAUDE_GUARD_PROBE_PRIMARY', 'CLAUDE_GUARD_PROBE_SECONDARY', 'CLAUDE_GUARD_PROBE_JSON', 'CLAUDE_GUARD_PROBE_FIXTURE', 'CLAUDE_GUARD_PROBE_EVERY', 'CLAUDE_GUARD_WATCH_KILL') {
+    Remove-Item ("Env:\" + $v) -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
 Write-Host ("ИТОГ: проверок $checks, провалов $fails, пропущено $skips") -ForegroundColor $(if ($fails -eq 0) { 'Green' } else { 'Red' })
 exit $fails

@@ -45,7 +45,7 @@ $ErrorActionPreference = 'Continue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 $ProgressPreference = 'SilentlyContinue'
 
-$Version        = '1.3-windows'
+$Version        = '1.4-windows'
 $Root           = $PSScriptRoot
 if (-not $Root) { $Root = Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $GuardHome      = if ($env:CLAUDE_GUARD_HOME) { $env:CLAUDE_GUARD_HOME } else { Join-Path $env:LOCALAPPDATA 'claude-guard' }
@@ -55,6 +55,18 @@ $RealFile       = Join-Path $StateDir 'real-claude.txt'
 $LogFile        = Join-Path $StateDir 'guard.log'
 $ShimDir        = Join-Path $GuardHome 'bin'
 $ProbeTimeoutMs = if ($env:CLAUDE_GUARD_TIMEOUT) { [int]$env:CLAUDE_GUARD_TIMEOUT * 1000 } else { 12000 }
+# Пробники выхода. Cloudflare trace отдаёт ip и loc одной строкой и не имеет жёстких
+# лимитов; ipinfo.io — только последним: его бесплатный тариф упирается в HTTP 429,
+# и страж видел «нет ответа» при живом туннеле (отсюда ложные тревоги).
+$ProbeTracePrimary   = if ($env:CLAUDE_GUARD_PROBE_PRIMARY)   { $env:CLAUDE_GUARD_PROBE_PRIMARY }   else { 'https://1.1.1.1/cdn-cgi/trace' }
+$ProbeTraceSecondary = if ($env:CLAUDE_GUARD_PROBE_SECONDARY) { $env:CLAUDE_GUARD_PROBE_SECONDARY } else { 'https://claude.ai/cdn-cgi/trace' }
+$ProbeJsonUrl        = if ($env:CLAUDE_GUARD_PROBE_JSON)      { $env:CLAUDE_GUARD_PROBE_JSON }      else { 'https://ipinfo.io/json' }
+$ProbeAttempts       = if ($env:CLAUDE_GUARD_ATTEMPTS) { [int]$env:CLAUDE_GUARD_ATTEMPTS } else { 2 }
+# Тихий режим: не слать уведомления (сторож опрашивает стража каждые ~2.5 мин,
+# иначе каждая фоновая проверка давала пользователю «нет VPN» при живом туннеле).
+$Quiet               = ($env:CLAUDE_GUARD_QUIET -eq '1')
+$LastReasonFile      = Join-Path $StateDir 'last-reason'
+$script:ProbeSource  = ''
 $BlockedCountry = if ($env:CLAUDE_GUARD_BLOCKED_COUNTRY) { $env:CLAUDE_GUARD_BLOCKED_COUNTRY } else { 'RU' }
 $VpnPattern     = 'WireGuard|Wintun|TAP-|Tap-Windows|OpenVPN|NordLynx|Proton|Mullvad|Happ|sing-box|Amnezia|Outline|Shadowsocks|Hiddify|Tunnel|VPN|TUN'
 # 4-я проверка: вердикт Anthropic из логов Claude Desktop
@@ -79,6 +91,7 @@ function Show-Balloon([string]$Title, [string]$Text) {
     # Уведомление в трее. Только Windows и только через ленивый scriptblock:
     # если написать типы WinForms прямо в теле функции, PowerShell попытается
     # разрешить их при JIT и упадёт ДО входа в try (проверено на Linux-тесте).
+    if ($Quiet) { return }   # фоновые проверки сторожа не шлют уведомлений
     if ($env:OS -ne 'Windows_NT') { return }
     try {
         $code = @'
@@ -193,39 +206,71 @@ function Get-TunnelState {
     return [pscustomobject]$state
 }
 
+function Invoke-Probe([string]$Url, [string]$Mode) {
+    # Один HTTP-запрос пробы. Пустая строка = не ответил.
+    # CLAUDE_GUARD_PROBE_FIXTURE — каталог с файлами по имени пробника (trace/ipinfo):
+    # тестовый шов, чтобы проверять цепочку без сети. Нет файла = «не ответил».
+    if ($env:CLAUDE_GUARD_PROBE_FIXTURE) {
+        $f = Join-Path $env:CLAUDE_GUARD_PROBE_FIXTURE (Split-Path -Leaf $Url)
+        if (Test-Path -LiteralPath $f) { return (Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue) }
+        return ''
+    }
+    try {
+        $req = [System.Net.WebRequest]::Create($Url)
+        $req.Timeout = $ProbeTimeoutMs
+        $req.UserAgent = 'claude-guard'
+        if ($Mode -eq 'direct') {
+            $req.Proxy = $null
+        }
+        else {
+            $proxyUri = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $env:HTTP_PROXY } else { $null }
+            if ($proxyUri) {
+                $req.Proxy = New-Object System.Net.WebProxy($proxyUri)
+            }
+            else {
+                $req.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+                $req.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials
+            }
+        }
+        $resp = $req.GetResponse()
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $body = $reader.ReadToEnd()
+        $reader.Close(); $resp.Close()
+        return $body
+    } catch { return '' }
+}
+
+function Get-ExitInfo([string]$Mode) {
+    # Цепочка проб: Cloudflare trace (без лимитов) → trace домена Anthropic →
+    # ipinfo (жёсткие лимиты, поэтому последним). Каждая попытка повторяется.
+    $sim = $env:CLAUDE_GUARD_SIM
+    if ($sim -eq 'ru-exit') { return [pscustomobject]@{ Ip = '203.0.113.1'; Country = 'RU'; Source = 'sim' } }
+    if ($sim -eq 'timeout') { return [pscustomobject]@{ Ip = ''; Country = ''; Source = '' } }
+
+    for ($attempt = 1; $attempt -le $ProbeAttempts; $attempt++) {
+        foreach ($url in @($ProbeTracePrimary, $ProbeTraceSecondary)) {
+            $body = Invoke-Probe $url $Mode
+            $ip = if ($body -match '(?m)^ip=(\S+)') { $Matches[1] } else { '' }
+            $c = if ($body -match '(?m)^loc=(\S+)') { $Matches[1].ToUpper() } else { '' }
+            if ($ip -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') {
+                return [pscustomobject]@{ Ip = $ip; Country = $c; Source = $url }
+            }
+        }
+        $body = Invoke-Probe $ProbeJsonUrl $Mode
+        $ip = if ($body -match '"ip"\s*:\s*"([^"]+)"') { $Matches[1] } else { '' }
+        $c = if ($body -match '"country"\s*:\s*"([^"]+)"') { $Matches[1].ToUpper() } else { '' }
+        if ($ip -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') {
+            return [pscustomobject]@{ Ip = $ip; Country = $c; Source = $ProbeJsonUrl }
+        }
+        if ($attempt -lt $ProbeAttempts) { Start-Sleep -Seconds 1 }
+    }
+    return [pscustomobject]@{ Ip = ''; Country = ''; Source = '' }
+}
+
 function Get-ExitCountry([string]$Mode) {
     # $Mode: 'env' — как ходит Claude Code (через HTTPS_PROXY, если задан, иначе системный прокси)
     #        'direct' — без прокси
-    $sim = $env:CLAUDE_GUARD_SIM
-    if ($sim -eq 'ru-exit') { return 'RU' }
-    if ($sim -eq 'timeout') { return '' }
-
-    foreach ($url in @('https://ipinfo.io/country', 'https://ifconfig.co/country-iso')) {
-        try {
-            $req = [System.Net.WebRequest]::Create($url)
-            $req.Timeout = $ProbeTimeoutMs
-            $req.UserAgent = 'claude-guard'
-            if ($Mode -eq 'direct') {
-                $req.Proxy = $null
-            }
-            else {
-                $proxyUri = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $env:HTTP_PROXY } else { $null }
-                if ($proxyUri) {
-                    $req.Proxy = New-Object System.Net.WebProxy($proxyUri)
-                }
-                else {
-                    $req.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
-                    $req.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials
-                }
-            }
-            $resp = $req.GetResponse()
-            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-            $body = $reader.ReadToEnd().Trim().ToUpper()
-            $reader.Close(); $resp.Close()
-            if ($body -match '^[A-Z]{2}$') { return $body }
-        } catch { }
-    }
-    return ''
+    return (Get-ExitInfo $Mode).Country
 }
 
 function Get-UnixNow {
@@ -306,27 +351,11 @@ function Add-BlockedIp([string]$Ip) {
 
 function Get-ExitIp {
     # ВАЖНО: только адреса, которые идут ЧЕРЕЗ туннель (правила сплита отправляют
-    # ipify/checkip напрямую — они покажут домашний РФ-адрес и обманут проверку).
+    # часть доменов напрямую — они покажут домашний РФ-адрес и обманут проверку).
     # $env:CLAUDE_GUARD_EXIT_IP — подстановка выхода без сети (тесты).
     if ($env:CLAUDE_GUARD_EXIT_IP) { return $env:CLAUDE_GUARD_EXIT_IP }
     if ($env:CLAUDE_GUARD_SIM -in @('timeout', 'no-tun')) { return '' }
-    foreach ($attempt in 1..2) {
-        foreach ($url in @('https://ipinfo.io/ip', 'https://ifconfig.co/ip')) {
-            try {
-                $req = [System.Net.WebRequest]::Create($url)
-                $req.Timeout = $ProbeTimeoutMs
-                $req.UserAgent = 'claude-guard'
-                $req.Proxy = $null
-                $resp = $req.GetResponse()
-                $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
-                $body = $reader.ReadToEnd().Trim()
-                $reader.Close(); $resp.Close()
-                if ($body -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') { return $body }
-            } catch { }
-        }
-        if ($attempt -eq 1) { Start-Sleep -Seconds 2 }
-    }
-    return ''
+    return (Get-ExitInfo 'direct').Ip
 }
 
 # Глобальный маршрут IPv6 по умолчанию мимо туннеля = возможная утечка реального IP
@@ -417,14 +446,17 @@ function Invoke-GuardChecks {
         Write-Host '  [warn] IPv6: туннель не определён — проверить нечего' -ForegroundColor Yellow
     }
 
-    $cEnv = Get-ExitCountry 'env'
-    $cDirect = Get-ExitCountry 'direct'
+    $eEnv = Get-ExitInfo 'env'
+    $cEnv = $eEnv.Country
+    $eDirect = Get-ExitInfo 'direct'
+    $cDirect = $eDirect.Country
+    $script:ProbeSource = if ($eEnv.Source) { $eEnv.Source } else { $eDirect.Source }
 
     if ($cEnv -and $cEnv -ne $BlockedCountry) {
         Write-Host ("  [OK  ] выход (как ходит Claude Code): $cEnv") -ForegroundColor Green
     }
     else {
-        Write-Host ("  [FAIL] выход (как ходит Claude Code): " + $(if ($cEnv) { $cEnv } else { 'нет ответа' })) -ForegroundColor Red
+        Write-Host ("  [FAIL] выход (как ходит Claude Code): " + $(if ($cEnv) { $cEnv } else { 'пробник не ответил' })) -ForegroundColor Red
         $verdict = 1
     }
 
@@ -432,11 +464,15 @@ function Invoke-GuardChecks {
         Write-Host ("  [OK  ] выход (напрямую): $cDirect") -ForegroundColor Green
     }
     else {
-        Write-Host ("  [FAIL] выход (напрямую): " + $(if ($cDirect) { $cDirect } else { 'нет ответа' })) -ForegroundColor Red
+        Write-Host ("  [FAIL] выход (напрямую): " + $(if ($cDirect) { $cDirect } else { 'пробник не ответил' })) -ForegroundColor Red
         $verdict = 1
     }
 
-    if ($verdict -ne 0 -and -not $script:BlockReason) { $script:BlockReason = 'country' }
+    # Пустой ответ обоих пробников — это не «выход из РФ», а «проба не ответила»:
+    # причина уходит в уведомление и в сторож (чтобы не писать «нет VPN» зря).
+    if ($verdict -ne 0 -and -not $script:BlockReason) {
+        $script:BlockReason = if ((-not $cEnv) -and (-not $cDirect)) { 'no-answer' } else { 'country' }
+    }
 
     # 4-я проверка: принимает ли этот выход Anthropic
     if ($verdict -eq 0) {
@@ -450,7 +486,10 @@ function Invoke-GuardChecks {
     else { Write-Host '  [SKIP] Anthropic: проверка не выполнялась (сначала туннель и страна)' }
 
     Write-Host ''
-    Write-Log ("verdict=$verdict reason=" + $(if ($script:BlockReason) { $script:BlockReason } else { 'none' }) + " mode=$Mode adapter=" + $(if ($tunnel.HasAdapter) { 'yes' } else { 'no' }) + " route=" + $(if ($tunnel.RouteViaVpn) { 'vpn' } else { $tunnel.RouteIface }) + " country_env=" + $(if ($cEnv) { $cEnv } else { '?' }) + " country_direct=" + $(if ($cDirect) { $cDirect } else { '?' }) + ' sim=' + $env:CLAUDE_GUARD_SIM)
+    # Причина пишется в файл: сторож читает её, чтобы назвать причину в уведомлении,
+    # а не писать «нет VPN-туннеля» на любой отказ.
+    try { Set-Content -LiteralPath $LastReasonFile -Value $(if ($script:BlockReason) { $script:BlockReason } else { '' }) -Encoding ASCII -NoNewline } catch { }
+    Write-Log ("verdict=$verdict reason=" + $(if ($script:BlockReason) { $script:BlockReason } else { 'none' }) + " mode=$Mode adapter=" + $(if ($tunnel.HasAdapter) { 'yes' } else { 'no' }) + " route=" + $(if ($tunnel.RouteViaVpn) { 'vpn' } else { $tunnel.RouteIface }) + " country_env=" + $(if ($cEnv) { $cEnv } else { '?' }) + " country_direct=" + $(if ($cDirect) { $cDirect } else { '?' }) + " src=" + $(if ($script:ProbeSource) { Split-Path -Leaf $script:ProbeSource } else { '?' }) + ' sim=' + $env:CLAUDE_GUARD_SIM)
     return $verdict
 }
 
@@ -591,6 +630,19 @@ function Show-Doctor {
     Write-Host ("  шим сейчас: " + $(if (Test-Path (Join-Path $ShimDir 'claude.cmd')) { 'поставлен' } else { 'НЕ поставлен' }))
 }
 
+function Get-BlockNotifyText {
+    # Текст уведомления по фактической причине (общий «нет VPN» на все случаи давал
+    # ложные тревоги, когда туннель был жив, а не ответила проба).
+    switch ($script:BlockReason) {
+        'anthropic' { return 'Anthropic отклоняет этот выход VPN — смени узел.' }
+        'no-answer' { return 'Туннель есть, но проба выхода не ответила. Проверь сеть/VPN.' }
+        'country' { return 'Выход идёт из РФ или страна не определилась. Включи/переключи VPN.' }
+        'ipv6' { return 'Утечка IPv6 мимо туннеля — отключи IPv6 или включи его туннелирование.' }
+        'tunnel' { return 'VPN-туннель не активен. Включи VPN и повтори.' }
+        default { return 'Проверка не пройдена. Диагностика: claude-guard.ps1 -Status' }
+    }
+}
+
 function Show-GuardHelp {
     if ($script:BlockReason -eq 'ipv6') {
         Write-Host '  Причина: есть глобальный маршрут IPv6 мимо туннеля — трафик может уйти'
@@ -602,6 +654,11 @@ function Show-GuardHelp {
         Write-Host '  Причина: Anthropic отклонил IP этого выхода (region_unavailable).'
         Write-Host '  Что делать: смени узел/страну в VPN-клиенте (не датацентр США) и повтори.'
         Write-Host '  Пометка снимется сама при смене выхода (claude-guard.ps1 -Status).'
+    }
+    elseif ($script:BlockReason -eq 'no-answer') {
+        Write-Host '  Причина: туннель поднят, но ни один пробник выхода не ответил —'
+        Write-Host '  трафик мог не дойти (сеть/провайдер/VPN-клиент на переподключении).'
+        Write-Host '  Что делать: проверь соединение и повтори; диагностика: claude-guard.ps1 -Status'
     }
     else {
         Write-Host '  Что делать: включи VPN, дождись подключения, повтори.'
@@ -655,7 +712,7 @@ switch ($Mode) {
         if ($rc -ne 0) {
             Write-Host 'ОТКАЗ: Claude заблокирован — трафик может уйти из РФ или быть отклонён Anthropic.' -ForegroundColor Red
             Show-GuardHelp
-            Show-Balloon 'Claude заблокирован' 'Нет VPN, выход из РФ или Anthropic отклоняет этот выход.'
+            Show-Balloon 'Claude заблокирован' (Get-BlockNotifyText)
         }
         exit $rc
     }
@@ -695,7 +752,7 @@ else {
         Write-Host '  ЗАПУСК ОТМЕНЁН: нет уверенности, что Anthropic видит нас не из РФ.' -ForegroundColor Red
         Show-GuardHelp
         Write-Host '──────────────────────────────────────────────────────────────'
-        Show-Balloon 'Claude Code не запущен' $(if ($script:BlockReason -eq 'anthropic') { 'Anthropic отклоняет этот выход VPN — смени узел.' } else { 'Нет VPN или выход из РФ.' })
+        Show-Balloon 'Claude Code не запущен' (Get-BlockNotifyText)
         Write-Log "launch BLOCKED args=$($ClaudeArgs -join ' ')"
         exit 1
     }

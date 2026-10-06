@@ -9,8 +9,9 @@
 #
 #   claude-desktop-watchdog [--once] [--dry-run] [--help]
 # Переменные: WATCH_INTERVAL (15), WATCH_THRESHOLD (2), WATCH_PROBE_EVERY (10),
-#   WATCH_PATTERNS, WATCH_TUN_IF, WATCH_KILL=0 (не убивать), WATCH_FORCE_DOWN=1
-#   (симуляция падения туннеля), WATCH_FORCE_REGION=1 (симуляция жалобы Anthropic)
+#   WATCH_GUARD_THRESHOLD (4), WATCH_PATTERNS, WATCH_TUN_IF, WATCH_PROBE_TRACE,
+#   WATCH_KILL=0 (не убивать), WATCH_FORCE_DOWN=1 (симуляция падения туннеля),
+#   WATCH_FORCE_REGION=1 (симуляция жалобы Anthropic)
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -33,6 +34,10 @@ ONCE="${WATCH_ONCE:-0}"
 VPN_IFACE_RE="${CLAUDE_GUARD_IFACE_RE:-^(tun|tap|wg|ppp|utun|ipsec|proton|nordlynx|mullvad|sing|nevpn|happ)}"
 REGION_RE='region_unavailable|not available in your region'
 REGION_STALE=900    # вердикт старше этого возраста не относим к текущему выходу
+# Сколько провалов ПОДРЯД нужно, чтобы гасить по результату полной проверки стража
+# (потеря туннеля гасится раньше — THRESHOLD, это грубее и однозначнее).
+GUARD_THRESHOLD="${WATCH_GUARD_THRESHOLD:-4}"
+PROBE_TRACE_URL="${WATCH_PROBE_TRACE:-https://1.1.1.1/cdn-cgi/trace}"
 
 for a in "$@"; do
   case "$a" in
@@ -42,8 +47,9 @@ for a in "$@"; do
   esac
 done
 
-# В одноразовом прогоне действуем по первому же замеру, иначе порог 2 недостижим.
+# В одноразовом прогоне действуем по первому же замеру, иначе пороги недостижимы.
 if [ "$ONCE" = "1" ] && [ -z "${WATCH_THRESHOLD:-}" ]; then THRESHOLD=1; fi
+if [ "$ONCE" = "1" ] && [ -z "${WATCH_GUARD_THRESHOLD:-}" ]; then GUARD_THRESHOLD=1; fi
 
 logline() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
 
@@ -116,7 +122,9 @@ region_verdict_new() {
 }
 
 current_ip() {
-  curl -s --noproxy '*' --max-time 10 https://ipinfo.io/ip 2>/dev/null | tr -d '\r\n ' | head -c 45
+  # Cloudflare trace: без лимитов (ipinfo.io отдаёт 429 и показывал пустоту)
+  curl -s --noproxy '*' --max-time 10 "$PROBE_TRACE_URL" 2>/dev/null \
+    | sed -n 's/^ip=//p' | head -1 | tr -d '\r\n ' | head -c 45
 }
 
 record_blocked_ip() {
@@ -161,13 +169,16 @@ kill_claude() {
   local left=""
   for pid in $v; do kill -0 "$pid" 2>/dev/null && left="$left $pid"; done
   [ -n "$left" ] && printf '%s\n' $left | xargs -r kill -KILL 2>/dev/null
-  if [ "$reason" = "region" ]; then
-    notify "Claude остановлен" "Anthropic не принимает текущий выход VPN (region_unavailable). Смени узел."
-    echo "Anthropic отклонил выход — погашено процессов: $n"
-  else
-    notify "Claude остановлен" "Пропал VPN-туннель. Claude закрыт, чтобы не выйти из РФ."
-    echo "Туннель пропал — погашено процессов: $n"
-  fi
+  case "$reason" in
+    region)          notify "Claude остановлен" "Anthropic не принимает текущий выход VPN (region_unavailable). Смени узел." ;;
+    tunnel)          notify "Claude остановлен" "Пропал VPN-туннель. Claude закрыт, чтобы не выйти из РФ." ;;
+    guard:no-answer) notify "Claude остановлен" "Проба выхода не отвечает $THRESHOLD проверок подряд. Claude закрыт — проверь VPN/сеть." ;;
+    guard:country)   notify "Claude остановлен" "Выход идёт из РФ $THRESHOLD проверок подряд. Claude закрыт — включи/переключи VPN." ;;
+    guard:ipv6)      notify "Claude остановлен" "Утечка IPv6 мимо туннеля. Claude закрыт." ;;
+    guard:anthropic) notify "Claude остановлен" "Anthropic не принимает этот выход VPN. Claude закрыт — смени узел." ;;
+    *)               notify "Claude остановлен" "Проверка не пройдена ($reason). Claude закрыт." ;;
+  esac
+  echo "Погашено процессов: $n (причина: $reason)"
   return 0
 }
 
@@ -186,30 +197,37 @@ handle_region_verdict() {
   kill_claude region
 }
 
-fails=0
+fails=0            # провалы проверки туннеля подряд
+gfails=0           # провалы полной проверки стража подряд (страна/проба/Anthropic)
 cycles=0
-logline "watchdog start (interval=${INTERVAL}s threshold=${THRESHOLD} kill=${KILL} patterns=${PATTERNS})"
+logline "watchdog start (interval=${INTERVAL}s threshold=${THRESHOLD} guard_threshold=${GUARD_THRESHOLD} kill=${KILL} patterns=${PATTERNS})"
 
 while :; do
   cycles=$((cycles + 1))
-  ok=1
+  tunnel_bad=0
+  guard_bad=""
 
   if ! tunnel_ok; then
-    ok=0
+    tunnel_bad=1
   elif [ "$PROBE_EVERY" -gt 0 ] && [ $((cycles % PROBE_EVERY)) -eq 0 ]; then
-    "$GUARD" --check >/dev/null 2>&1 || ok=0
+    # QUIET: уведомления шлёт только сторож, причём по факту гашения — иначе
+    # каждая фоновая проверка давала пользователю «нет VPN» при живом туннеле.
+    if ! CLAUDE_GUARD_QUIET=1 "$GUARD" --check >/dev/null 2>&1; then
+      guard_bad="$(cat "$STATE_DIR/last-reason" 2>/dev/null)"
+      [ -z "$guard_bad" ] && guard_bad="unknown"
+    fi
   fi
 
-  if [ "$ok" = "1" ]; then
-    fails=0
+  if [ "$tunnel_bad" = "1" ]; then
+    fails=$((fails + 1)); gfails=0
+    logline "tunnel check failed ($fails/$THRESHOLD), force_down=$FORCE_DOWN"
+    if [ "$fails" -ge "$THRESHOLD" ]; then kill_claude tunnel; fails=0; fi
+  elif [ -n "$guard_bad" ]; then
+    fails=0; gfails=$((gfails + 1))
+    logline "guard check failed ($gfails/$GUARD_THRESHOLD) reason=${guard_bad}"
+    if [ "$gfails" -ge "$GUARD_THRESHOLD" ]; then kill_claude "guard:${guard_bad}"; gfails=0; fi
   else
-    fails=$((fails + 1))
-    logline "check failed ($fails/$THRESHOLD), force_down=$FORCE_DOWN"
-  fi
-
-  if [ "$fails" -ge "$THRESHOLD" ]; then
-    kill_claude tunnel
-    fails=0
+    fails=0; gfails=0
   fi
 
   # Вердикт Anthropic (region_unavailable) — независимый от туннеля сигнал
